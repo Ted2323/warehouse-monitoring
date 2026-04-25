@@ -11,14 +11,26 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from classes import (
-    CLASS_NAMES,
-    PPE_VIOLATION_CLASSES,
-    WORKER_CLASSES,
-    PALLET_CLASSES,
-    FORKLIFT_CLASSES,
-    VIOLATION_SEVERITY,
-)
+try:
+    # Loaded as part of the `ml` package (Docker / Render: `uvicorn ml.server:app`).
+    from .classes import (
+        CLASS_NAMES,
+        PPE_VIOLATION_CLASSES,
+        WORKER_CLASSES,
+        PALLET_CLASSES,
+        FORKLIFT_CLASSES,
+        VIOLATION_SEVERITY,
+    )
+except ImportError:
+    # Loaded as a top-level module (local `cd ml && python detect.py ...`).
+    from classes import (  # type: ignore[no-redef]
+        CLASS_NAMES,
+        PPE_VIOLATION_CLASSES,
+        WORKER_CLASSES,
+        PALLET_CLASSES,
+        FORKLIFT_CLASSES,
+        VIOLATION_SEVERITY,
+    )
 
 
 # ─── INSTALL DEPS IF NEEDED ─────────────────────────────────
