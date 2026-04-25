@@ -42,8 +42,8 @@ const THEME_BOOTSTRAP = `
 })();
 `;
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
-  const theme = cookies().get("theme")?.value;
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const theme = (await cookies()).get("theme")?.value;
   const isDark = theme === "dark";
 
   return (

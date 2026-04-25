@@ -4,17 +4,22 @@ Warehouse Detection — FastAPI Service
 Wraps detect.py as an HTTP microservice.
 The Next.js API route calls POST /detect when DETECTION_SERVICE_URL is set.
 
-Usage:
+Local usage (cwd = ml/):
     pip install -r requirements.txt
     uvicorn server:app --host 0.0.0.0 --port 8000
 
     # parallel-frontend dev (no model required)
     USE_MOCK=1 uvicorn server:app --host 0.0.0.0 --port 8000
     # or pass --mock when launching via `python server.py`
+
+Container usage (cwd = /app, ml/ is a package):
+    uvicorn ml.server:app --host 0.0.0.0 --port 8000
 """
 
 import os
 import json
+import logging
+import sys
 import tempfile
 from pathlib import Path
 
@@ -25,18 +30,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from detect import (
-    check_ppe_violations,
-    check_violations,
-    get_zones,
-    run_inference,
-    save_detection_log,
-    summarize_inventory,
-)
+# detect.py lives next to this file. When uvicorn loads us as `ml.server`
+# (Docker / Render), the relative import works. When loaded as plain `server`
+# (local `cd ml && uvicorn server:app`), the relative import has no parent
+# package, so we fall back to the absolute name.
+try:
+    from .detect import (
+        check_ppe_violations,
+        check_violations,
+        get_zones,
+        run_inference,
+        save_detection_log,
+        summarize_inventory,
+    )
+except ImportError:
+    from detect import (  # type: ignore[no-redef]
+        check_ppe_violations,
+        check_violations,
+        get_zones,
+        run_inference,
+        save_detection_log,
+        summarize_inventory,
+    )
 
-load_dotenv("../.env")   # load NEXT_PUBLIC_SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY
+# In dev the .env sits at the repo root (one level above ml/). In production
+# every value comes from the platform's env config and this call is a no-op.
+load_dotenv("../.env")
 
-app = FastAPI(title="Warehouse Detection Service", version="2.0.0")
+log = logging.getLogger("warehouse.server")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+app = FastAPI(title="Warehouse Detection Service", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,11 +69,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── ENV ─────────────────────────────────────────────────────
 MODEL_PATH      = os.environ.get("MODEL_PATH", "./best.pt")
-USE_MOCK        = os.environ.get("USE_MOCK", "0") == "1"
+
+# `MOCK_MODE` is the canonical deploy-time switch (set by render.yaml). The
+# older `USE_MOCK` env var and the `--mock` CLI flag are kept as aliases so
+# pre-section-11 muscle memory still works.
+MOCK_MODE       = (
+    os.environ.get("MOCK_MODE", "").strip().lower() == "true"
+    or os.environ.get("USE_MOCK", "0") == "1"
+)
 MOCK_PATH       = Path(__file__).parent / "fixtures" / "mock_detection.json"
 SERVICE_TOKEN   = os.environ.get("DETECTION_SERVICE_TOKEN", "")
 PUBLIC_PATHS    = {"/health"}
+
+# Supabase Storage source for the model weight (used when not in mock mode).
+SUPABASE_URL          = os.environ.get("NEXT_PUBLIC_SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+MODEL_BUCKET          = os.environ.get("MODEL_BUCKET", "models")
+MODEL_OBJECT          = os.environ.get("MODEL_OBJECT", "best.pt")
 
 
 # ─── BEARER TOKEN GATE ───────────────────────────────────────
@@ -70,6 +108,58 @@ async def require_token(request: Request, call_next):
     return await call_next(request)
 
 
+# ─── STARTUP HOOK ────────────────────────────────────────────
+def _download_model_from_supabase(dest: Path) -> None:
+    """Pull MODEL_BUCKET/MODEL_OBJECT to `dest` using the service role key."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        raise RuntimeError(
+            "Cannot download model: NEXT_PUBLIC_SUPABASE_URL and "
+            "SUPABASE_SERVICE_ROLE_KEY must both be set."
+        )
+
+    from supabase import create_client  # local import — heavy dep
+
+    log.info("Downloading model from Supabase Storage: %s/%s", MODEL_BUCKET, MODEL_OBJECT)
+    sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    blob = sb.storage.from_(MODEL_BUCKET).download(MODEL_OBJECT)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(blob)
+    size_mb = dest.stat().st_size / (1024 * 1024)
+    log.info("Model written to %s (%.1f MB)", dest, size_mb)
+
+
+@app.on_event("startup")
+def ensure_model_available() -> None:
+    """
+    Resolve the inference source before the first request lands:
+      * MOCK_MODE=true   → require ml/fixtures/mock_detection.json
+      * otherwise         → require best.pt; download from Supabase if missing
+    Failing here makes the container exit instead of serving a broken instance.
+    """
+    if MOCK_MODE:
+        if not MOCK_PATH.exists():
+            log.error("MOCK_MODE is on but mock fixture is missing: %s", MOCK_PATH)
+            raise RuntimeError(f"Mock fixture missing: {MOCK_PATH}")
+        log.info("Starting in MOCK_MODE — serving fixture from %s", MOCK_PATH)
+        return
+
+    model = Path(MODEL_PATH)
+    if model.exists():
+        log.info("Model present at %s — skipping download", model)
+        return
+
+    try:
+        _download_model_from_supabase(model)
+    except Exception as exc:
+        log.exception("Failed to download model from Supabase Storage")
+        # Fail loudly: we are not in mock mode and have no weights. The brief
+        # explicitly says fail, don't fall back silently.
+        raise RuntimeError(
+            f"No model available. MOCK_MODE is off, MODEL_PATH={MODEL_PATH} does "
+            f"not exist, and the Supabase Storage download failed: {exc}"
+        ) from exc
+
+
 # ─── SCHEMAS ─────────────────────────────────────────────────
 class DetectRequest(BaseModel):
     image_url: str
@@ -80,13 +170,18 @@ class DetectRequest(BaseModel):
 # ─── ROUTES ──────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": MODEL_PATH, "mock": USE_MOCK}
+    return {
+        "status":     "ok",
+        "model_path": MODEL_PATH,
+        "model_present": Path(MODEL_PATH).exists(),
+        "mock_mode":  MOCK_MODE,
+    }
 
 
 @app.post("/detect")
 async def detect(req: DetectRequest):
     # ── Mock mode: serve fixture, skip download + inference ──
-    if USE_MOCK:
+    if MOCK_MODE:
         if not MOCK_PATH.exists():
             raise HTTPException(status_code=500, detail=f"Mock fixture missing: {MOCK_PATH}")
         with open(MOCK_PATH) as f:
@@ -147,7 +242,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mock:
-        os.environ["USE_MOCK"] = "1"
-        USE_MOCK = True
+        # Set both names so the startup hook + middleware see consistent state.
+        os.environ["MOCK_MODE"] = "true"
+        os.environ["USE_MOCK"]  = "1"
+        MOCK_MODE = True
 
     uvicorn.run(app, host=args.host, port=args.port)

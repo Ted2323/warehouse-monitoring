@@ -1,12 +1,15 @@
 // Auth gate. Anyone hitting a non-/login page without a session is bounced
 // to /login; authenticated users hitting /login are bounced to /dashboard.
 //
+// Renamed from middleware.ts in Next.js 16 (see
+// https://nextjs.org/docs/messages/middleware-to-proxy). The function name,
+// not just the file, must be `proxy`. The matcher config export is unchanged.
 // We use @supabase/ssr (the modern replacement for auth-helpers-nextjs).
 
 import { NextResponse, type NextRequest } from "next/server";
 import { createServerClient, type CookieOptions } from "@supabase/ssr";
 
-export async function middleware(req: NextRequest) {
+export async function proxy(req: NextRequest) {
   const res = NextResponse.next();
 
   const supabase = createServerClient(
