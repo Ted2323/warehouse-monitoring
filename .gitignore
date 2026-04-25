@@ -1,0 +1,33 @@
+# ── Secrets / env ─────────────────────────────────────────────
+# Never commit anything that holds keys, tokens, or per-environment URLs.
+.env
+.env.local
+.env.*.local
+
+# ── Model weights ─────────────────────────────────────────────
+# Models are uploaded to Supabase Storage and downloaded at runtime —
+# do not let any *.pt or *.onnx land in git.
+**/*.pt
+**/*.onnx
+
+# ── Frontend ──────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+
+# ── ML / Python ───────────────────────────────────────────────
+ml/__pycache__/
+ml/*.pyc
+ml/runs/
+data/dataset/
+**/__pycache__/
+**/*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# ── OS / Editor ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/*.code-snippets
+*.swp

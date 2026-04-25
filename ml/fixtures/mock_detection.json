@@ -1,0 +1,29 @@
+{
+  "detections": [
+    { "class": "worker_with_helmet",     "confidence": 0.92, "bbox": [120, 220, 200, 410], "cx": 160, "cy": 315 },
+    { "class": "worker_with_reflective", "confidence": 0.91, "bbox": [120, 220, 200, 410], "cx": 160, "cy": 315 },
+    { "class": "worker_no_helmet",       "confidence": 0.88, "bbox": [340, 230, 420, 420], "cx": 380, "cy": 325 },
+    { "class": "pallet_filled",          "confidence": 0.95, "bbox": [520, 110, 700, 280], "cx": 610, "cy": 195 },
+    { "class": "pallet_empty",           "confidence": 0.93, "bbox": [720, 130, 880, 290], "cx": 800, "cy": 210 },
+    { "class": "forklift_with_boxes",    "confidence": 0.94, "bbox": [60,  300, 280, 520], "cx": 170, "cy": 410 }
+  ],
+  "ppe_violations": [
+    {
+      "class": "worker_no_helmet",
+      "bbox": [340, 230, 420, 420],
+      "confidence": 0.88,
+      "alert_level": "danger"
+    }
+  ],
+  "zone_violations": [],
+  "inventory": {
+    "pallets_filled": 1,
+    "pallets_empty": 1,
+    "forklifts_carrying": 1,
+    "forklifts_idle": 0,
+    "workers_total": 3,
+    "workers_compliant": 1
+  },
+  "total_objects": 6,
+  "total_violations": 1
+}

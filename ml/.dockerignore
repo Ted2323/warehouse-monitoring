@@ -1,0 +1,11 @@
+__pycache__
+**/__pycache__
+.venv
+.pytest_cache
+
+# Model weights — pulled from Supabase Storage at startup, never baked in.
+*.pt
+*.onnx
+
+# Training artifacts have no place in a serving image.
+runs/

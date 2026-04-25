@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Design tokens (Claude warm-paper theme) ─────────────── */
+:root {
+  /* Surfaces */
+  --bg:            #F0EEE6;
+  --bg-elevated:   #FAF9F5;
+  --bg-sunken:     #E8E6DD;
+
+  /* Text */
+  --fg:            #1F1E1D;
+  --fg-muted:      #5A5651;
+  --fg-subtle:     #8C8779;
+
+  /* Lines */
+  --border:        #D9D6CB;
+  --border-strong: #BFBBAE;
+
+  /* Accent — Claude coral */
+  --accent:        #C15F3C;
+  --accent-hover:  #A94F2F;
+  --accent-fg:     #FFFFFF;
+
+  /* Semantic — muted, earthy */
+  --success:       #3F7D58;
+  --warning:       #B07F2A;
+  --danger:        #A93B2C;
+}
+
+.dark {
+  --bg:            #262624;
+  --bg-elevated:   #30302D;
+  --bg-sunken:     #1F1E1D;
+
+  --fg:            #F0EEE6;
+  --fg-muted:      #A8A39A;
+  --fg-subtle:     #6E6A62;
+
+  --border:        #3A3935;
+  --border-strong: #52504B;
+
+  --accent:        #D87C5B;
+  --accent-hover:  #E08F70;
+  --accent-fg:     #1F1E1D;
+
+  --success:       #5DA078;
+  --warning:       #D1A24A;
+  --danger:        #C8584A;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html { height: 100%; }
+
+body {
+  min-height: 100%;
+  font-family: var(--font-sans), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  color: var(--fg);
+  background-color: var(--bg);
+}
+
+/* ── Progress bar ───────────────────────────────────────── */
+.progress-bar {
+  display: block;
+  width: 100%;
+  height: 4px;
+  border: none;
+  border-radius: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--bg-sunken);
+}
+.progress-bar::-webkit-progress-bar   { background: var(--bg-sunken); border-radius: 4px; }
+.progress-bar::-webkit-progress-value { background: var(--accent); border-radius: 4px; transition: width .25s ease; }
+.progress-bar::-moz-progress-bar      { background: var(--accent); border-radius: 4px; }
+
+/* ── Scrollbar ──────────────────────────────────────────── */
+::-webkit-scrollbar             { width: 6px; height: 6px; }
+::-webkit-scrollbar-track       { background: transparent; }
+::-webkit-scrollbar-thumb       { background: var(--border-strong); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--fg-subtle); }
+
+/* ── Spin animation ─────────────────────────────────────── */
+@keyframes spin { to { transform: rotate(360deg); } }

@@ -1,0 +1,26 @@
+# Render service descriptor for the FastAPI inference service.
+# Push to main → Render rebuilds this service from ./ml/Dockerfile.
+#
+# DETECTION_SERVICE_TOKEN must match the value set in Vercel exactly,
+# or the bearer-token check in ml/server.py rejects every request.
+
+services:
+  - type: web
+    name: warehouse-detection
+    runtime: docker
+    dockerfilePath: ./ml/Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DETECTION_SERVICE_TOKEN
+        sync: false
+      - key: MOCK_MODE
+        value: "true"   # use mock fixture until best.pt is uploaded
+      - key: MODEL_BUCKET
+        value: "models"
+      - key: MODEL_OBJECT
+        value: "best.pt"

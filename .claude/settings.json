@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//tmp/**)",
+      "Bash(npx eslint:*)",
+      "Bash(ls .eslint*)",
+      "Bash(npm run:*)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\zweht\\Desktop\\warehouse-monitor"
+    ]
+  }
+}
