@@ -21,7 +21,7 @@ CONFIG = {
     "batch":        16,
     "project":      "./runs",
     "name":         "warehouse_monitor_v2",  # bumped for new 8-class set; keeps old runs intact
-    "device":       "0",             # GPU index; set "cpu" if no GPU
+    "device":       "cpu",           # GPU index (e.g. "0") if CUDA is available; "cpu" otherwise
     "patience":     10,              # early stopping
     "save_period":  10,
 }
