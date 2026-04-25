@@ -150,11 +150,19 @@ def summarize_inventory(detections: list) -> dict:
 
 
 # ─── YOLO INFERENCE ──────────────────────────────────────────
-def run_inference(image_path: str, model_path: str = "./best.pt") -> list:
+# Default confidence threshold. Ultralytics' default is 0.25, which is fine
+# for a model with mAP > 0.7 but filters out too much from a model with
+# modest accuracy (≤0.5). DETECT_CONF env var lets us tune in production
+# without a code change.
+DETECT_CONF = float(os.environ.get("DETECT_CONF", "0.10"))
+
+
+def run_inference(image_path: str, model_path: str = "./best.pt",
+                  conf: Optional[float] = None) -> list:
     from ultralytics import YOLO
 
     model = YOLO(model_path)
-    results = model(image_path, verbose=False)[0]
+    results = model(image_path, verbose=False, conf=conf or DETECT_CONF)[0]
 
     detections = []
     for box in results.boxes:
