@@ -5,6 +5,55 @@ import { NextRequest, NextResponse } from "next/server";
 // below uses hardcoded base-class detections + pre-derived violations so we
 // don't have to mirror the association rules from ml/associate.py here.
 
+// Vercel function budget — Render free-tier cold start can take ~30-60s,
+// and we want headroom for one retry inside the route. Hobby plan caps at
+// 60s; we ask for 30 so a single sluggish frame doesn't take the whole
+// video down.
+export const maxDuration = 30;
+
+// ─── COLD-START RETRY HELPERS ────────────────────────────────
+// Render's free tier spins the container down after ~15 min idle. The first
+// request after idle gets a 502/503 HTML page from Render's edge proxy in
+// ~100-200ms while the container boots (~30-60s). We hit /health to nudge
+// it awake, wait, and retry the actual /detect once. Warm requests bypass
+// this entirely.
+const COLD_START_STATUSES = new Set([502, 503, 504]);
+const COLD_START_RETRY_DELAY_MS = 8_000;
+
+async function fetchWithColdStartRetry(
+  serviceUrl: string,
+  serviceToken: string,
+  body: unknown,
+): Promise<Response> {
+  const url  = `${serviceUrl}/detect`;
+  const opts: RequestInit = {
+    method:  "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${serviceToken}`,
+    },
+    body: JSON.stringify(body),
+  };
+
+  let res = await fetch(url, opts);
+  if (!COLD_START_STATUSES.has(res.status)) return res;
+
+  // Discard the body so the connection can be reused for the retry, then
+  // poke /health (fire-and-forget) and wait for the container to boot.
+  res.body?.cancel().catch(() => {});
+  fetch(`${serviceUrl}/health`).catch(() => {});
+  await new Promise((r) => setTimeout(r, COLD_START_RETRY_DELAY_MS));
+
+  return fetch(url, opts);
+}
+
+function looksLikeRenderColdStart(status: number, body: string): boolean {
+  // Render's edge serves a branded HTML page on 502/503 during cold boot.
+  // Anything starting with `<` is HTML rather than a FastAPI JSON error,
+  // which strongly implies the container never received the request.
+  return COLD_START_STATUSES.has(status) && body.trimStart().startsWith("<");
+}
+
 // ─── SUPABASE (optional) ──────────────────────────────────────
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -154,22 +203,19 @@ export async function POST(req: NextRequest) {
           { status: 502 },
         );
       }
-      const res = await fetch(`${detectionServiceUrl}/detect`, {
-        method:  "POST",
-        headers: {
-          "Content-Type":  "application/json",
-          "Authorization": `Bearer ${serviceToken}`,
-        },
-        body: JSON.stringify({ image_url: imageUrl, camera_id: cameraId }),
-      });
+      const res = await fetchWithColdStartRetry(
+        detectionServiceUrl,
+        serviceToken,
+        { image_url: imageUrl, camera_id: cameraId },
+      );
       // Don't blindly JSON.parse — FastAPI errors come back as plain text
       // ("Internal Server Error") and would crash the route.
       if (!res.ok) {
         const text = await res.text().catch(() => "");
-        return NextResponse.json(
-          { error: `Detection service ${res.status}: ${text.slice(0, 300) || res.statusText}` },
-          { status: 502 },
-        );
+        const userMsg = looksLikeRenderColdStart(res.status, text)
+          ? "Detection service is waking up (free-tier cold start). Wait ~30 seconds and retry — the next request will be fast."
+          : `Detection service ${res.status}: ${text.slice(0, 300) || res.statusText}`;
+        return NextResponse.json({ error: userMsg }, { status: 502 });
       }
       const result = await res.json();
       detections        = result.detections         ?? [];

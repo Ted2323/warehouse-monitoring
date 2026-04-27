@@ -413,20 +413,27 @@ export default function DashboardPage() {
         const { frames, duration } = await extractFrames(file, 2);
         setProgress({ current: 0, total: frames.length });
         const sessionFrames: VideoFrame[] = [];
+        // Per-frame failures (e.g. Render cold-start 502 on the first frame)
+        // shouldn't kill the whole video — keep going, summarize at the end.
+        const failures: string[] = [];
 
         for (let i = 0; i < frames.length; i++) {
           const t = frames[i].t;
-          const entry = await processImage(frames[i].blob, `${file.name} — frame ${t}s`);
-          entry.videoTimeSeconds = t;
-          setAuditLog(prev => [entry, ...prev]);
-          onNewDetection(entry);
-          sessionFrames.push({
-            t,
-            detections:    entry.detections,
-            ppeViolations: entry.ppeViolations,
-            zoneViolations: entry.zoneViolations,
-            inventory:     entry.inventory,
-          });
+          try {
+            const entry = await processImage(frames[i].blob, `${file.name} — frame ${t}s`);
+            entry.videoTimeSeconds = t;
+            setAuditLog(prev => [entry, ...prev]);
+            onNewDetection(entry);
+            sessionFrames.push({
+              t,
+              detections:    entry.detections,
+              ppeViolations: entry.ppeViolations,
+              zoneViolations: entry.zoneViolations,
+              inventory:     entry.inventory,
+            });
+          } catch (frameErr: any) {
+            failures.push(`frame ${t}s: ${frameErr?.message ?? "failed"}`);
+          }
           setProgress({ current: i + 1, total: frames.length });
         }
 
@@ -434,7 +441,16 @@ export default function DashboardPage() {
           ? duration
           : (sessionFrames.length ? sessionFrames[sessionFrames.length - 1].t + 2 : 0);
 
-        setVideoSession({ url, duration: sessionDuration, frames: sessionFrames, filename: file.name });
+        if (sessionFrames.length > 0) {
+          setVideoSession({ url, duration: sessionDuration, frames: sessionFrames, filename: file.name });
+        }
+        if (failures.length > 0) {
+          // Surface a concise tally rather than the raw HTML error from
+          // Render's cold-start page.
+          const head = failures[0];
+          const more = failures.length > 1 ? ` (+${failures.length - 1} more)` : "";
+          setError(`${failures.length} of ${frames.length} frames failed${more} — ${head}`);
+        }
       }
     } catch (e: any) {
       setError(e.message);
