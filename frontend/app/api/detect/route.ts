@@ -1,15 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  CLASS_NAMES,
-  PPE_VIOLATION_CLASSES,
-  VIOLATION_SEVERITY,
-  isPpeViolation,
-} from "@/lib/classes";
+
+// NOTE on imports: when DETECTION_SERVICE_URL is set, this route is a thin
+// proxy and the FastAPI service does all class-aware work. The mock path
+// below uses hardcoded base-class detections + pre-derived violations so we
+// don't have to mirror the association rules from ml/associate.py here.
 
 // ─── SUPABASE (optional) ──────────────────────────────────────
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const hasSupabase  = !!(SUPABASE_URL && SUPABASE_KEY);
+
+// Set SKIP_DETECTION_PERSIST=true in .env.local to bypass Supabase Storage
+// uploads and detection_logs inserts. Useful in dev to avoid hitting free-tier
+// rate limits when analyzing videos (each frame would otherwise upload a JPG).
+const SKIP_PERSIST = process.env.SKIP_DETECTION_PERSIST === "true";
 
 function getSupabase() {
   const { createClient } = require("@supabase/supabase-js");
@@ -32,36 +36,49 @@ function pointInPolygon(cx: number, cy: number, polygon: number[][]): boolean {
   return inside;
 }
 
-// ─── MOCK DETECTIONS (demo mode — uses new 8-class set) ─────
+// ─── MOCK FIXTURE (demo mode — base-class detections + derived violations) ─
+// Mirrors ml/fixtures/mock_detection.json. Three workers exercising all three
+// PPE compliance states:
+//   A @ [120,80,220,380]  — compliant (helmet + vest associated)
+//   B @ [400,90,500,390]  — partial   (vest only)        → worker_no_helmet (danger)
+//   C @ [80,300,180,460]  — unsafe    (neither)          → worker_unsafe    (critical)
+// Pallet is filled (box inside). Forklift is operating because worker C's
+// center sits inside the forklift bbox (phase-2 worker-association rule).
 const MOCK_DETECTIONS = [
-  { class: "worker_with_helmet",     confidence: 0.92, bbox: [120, 220, 200, 410], cx: 160, cy: 315 },
-  { class: "worker_no_helmet",       confidence: 0.88, bbox: [340, 230, 420, 420], cx: 380, cy: 325 },
-  { class: "worker_with_reflective", confidence: 0.91, bbox: [120, 220, 200, 410], cx: 160, cy: 315 },
-  { class: "pallet_filled",          confidence: 0.95, bbox: [520, 110, 700, 280], cx: 610, cy: 195 },
-  { class: "pallet_empty",           confidence: 0.93, bbox: [720, 130, 880, 290], cx: 800, cy: 210 },
-  { class: "forklift_with_boxes",    confidence: 0.94, bbox: [60,  300, 280, 520], cx: 170, cy: 410 },
+  { class: "worker",   confidence: 0.91, bbox: [120, 80, 220, 380],  cx: 170, cy: 230 },
+  { class: "helmet",   confidence: 0.88, bbox: [150, 85, 200, 130],  cx: 175, cy: 107 },
+  { class: "vest",     confidence: 0.82, bbox: [120, 180, 220, 310], cx: 170, cy: 245 },
+  { class: "worker",   confidence: 0.86, bbox: [400, 90, 500, 390],  cx: 450, cy: 240 },
+  { class: "vest",     confidence: 0.79, bbox: [410, 180, 495, 290], cx: 452, cy: 235 },
+  { class: "worker",   confidence: 0.84, bbox: [80, 300, 180, 460],  cx: 130, cy: 380 },
+  { class: "pallet",   confidence: 0.83, bbox: [600, 300, 750, 420], cx: 675, cy: 360 },
+  { class: "box",      confidence: 0.77, bbox: [615, 310, 700, 390], cx: 657, cy: 350 },
+  { class: "forklift", confidence: 0.92, bbox: [50, 280, 280, 470],  cx: 165, cy: 375 },
 ];
 
-// ─── INVENTORY SUMMARY (mirrors ml/detect.py:summarize_inventory) ─
-function summarizeInventory(detections: any[]) {
-  const c: Record<string, number> = {};
-  for (const n of CLASS_NAMES) c[n] = 0;
-  for (const d of detections) if (c[d.class] !== undefined) c[d.class] += 1;
+const MOCK_PPE_VIOLATIONS = [
+  { class: "worker_no_helmet", bbox: [400, 90, 500, 390], confidence: 0.86, alert_level: "danger"   },
+  { class: "worker_unsafe",    bbox: [80, 300, 180, 460], confidence: 0.84, alert_level: "critical" },
+];
 
-  // Approximate; see TODO in ml/detect.py — needs a tracker for exact per-worker compliance.
-  const workersCompliant = Math.min(c["worker_with_helmet"], c["worker_with_reflective"]);
-  const workersTotal     = c["worker_with_helmet"] + c["worker_no_helmet"]
-                         + c["worker_with_reflective"] + c["worker_no_reflective_vest"];
+const MOCK_INVENTORY = {
+  pallets_filled:      1,
+  pallets_empty:       0,
+  forklifts_operating: 1,
+  forklifts_idle:      0,
+  workers_total:       3,
+  workers_compliant:   1,
+};
 
-  return {
-    pallets_filled:     c["pallet_filled"],
-    pallets_empty:      c["pallet_empty"],
-    forklifts_carrying: c["forklift_with_boxes"],
-    forklifts_idle:     c["forklift_no_carry"],
-    workers_total:      workersTotal,
-    workers_compliant:  workersCompliant,
-  };
-}
+const MOCK_COMPLIANCE_SUMMARY = {
+  workers_total:     3,
+  workers_compliant: 1,
+  workers_partial:   1,
+  workers_unsafe:    1,
+  critical_count:    1,
+  danger_count:      1,
+  warning_count:     0,
+};
 
 // ─── POST /api/detect ────────────────────────────────────────
 export async function POST(req: NextRequest) {
@@ -76,29 +93,45 @@ export async function POST(req: NextRequest) {
 
     let imageUrl = "";
 
-    // 1. Upload to Supabase Storage (skip if not configured)
-    if (hasSupabase) {
-      const supabase  = getSupabase();
-      const filename  = `detections/${Date.now()}-${file.name}`;
-      const arrayBuf  = await file.arrayBuffer();
-      const { error: uploadError } = await supabase.storage
-        .from("warehouse-images")
-        .upload(filename, arrayBuf, { contentType: file.type });
+    // 1. Upload to Supabase Storage (skip if not configured or persistence disabled).
+    // Failures here (e.g. rate limits during heavy video analysis) are non-fatal —
+    // detection still runs and returns boxes; we just lose the persisted thumbnail.
+    if (hasSupabase && !SKIP_PERSIST) {
+      try {
+        const supabase  = getSupabase();
+        // Supabase Storage rejects keys with spaces, em-dashes, and most non-ASCII.
+        // Strip everything outside [a-zA-Z0-9._-] so video frame names like
+        // "clip.mp4 — frame 0s" don't blow up the upload.
+        const ext  = (file.name.match(/\.([a-zA-Z0-9]+)$/)?.[1] ?? "bin").toLowerCase();
+        const safe = file.name
+          .replace(/\.[a-zA-Z0-9]+$/, "")
+          .replace(/[^a-zA-Z0-9._-]+/g, "_")
+          .replace(/_+/g, "_")
+          .slice(0, 80);
+        const filename  = `detections/${Date.now()}-${safe}.${ext}`;
+        const arrayBuf  = await file.arrayBuffer();
+        const { error: uploadError } = await supabase.storage
+          .from("warehouse-images")
+          .upload(filename, arrayBuf, { contentType: file.type });
 
-      if (uploadError) throw uploadError;
+        if (uploadError) throw uploadError;
 
-      const { data: { publicUrl } } = supabase.storage
-        .from("warehouse-images")
-        .getPublicUrl(filename);
+        const { data: { publicUrl } } = supabase.storage
+          .from("warehouse-images")
+          .getPublicUrl(filename);
 
-      imageUrl = publicUrl;
+        imageUrl = publicUrl;
+      } catch (err: any) {
+        console.warn("Storage upload skipped:", err?.message ?? err);
+      }
     }
 
     // 2. Run detection (real service or mock)
-    let detections: any[]    = [];
-    let ppeViolations: any[]  = [];
-    let zoneViolations: any[] = [];
-    let inventory: any        = {};
+    let detections: any[]            = [];
+    let ppeViolations: any[]         = [];
+    let zoneViolations: any[]        = [];
+    let inventory: any               = {};
+    let complianceSummary: any       = null;
 
     const detectionServiceUrl = process.env.DETECTION_SERVICE_URL;
 
@@ -112,6 +145,15 @@ export async function POST(req: NextRequest) {
           { status: 500 },
         );
       }
+      // The service fetches the image from `image_url`. If our storage upload
+      // failed (rate limit, invalid key, etc.) the URL is empty and the service
+      // will 500 — short-circuit with a clear error so the user knows why.
+      if (!imageUrl) {
+        return NextResponse.json(
+          { error: "Image upload failed; cannot reach detection service without an image URL." },
+          { status: 502 },
+        );
+      }
       const res = await fetch(`${detectionServiceUrl}/detect`, {
         method:  "POST",
         headers: {
@@ -120,51 +162,59 @@ export async function POST(req: NextRequest) {
         },
         body: JSON.stringify({ image_url: imageUrl, camera_id: cameraId }),
       });
+      // Don't blindly JSON.parse — FastAPI errors come back as plain text
+      // ("Internal Server Error") and would crash the route.
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        return NextResponse.json(
+          { error: `Detection service ${res.status}: ${text.slice(0, 300) || res.statusText}` },
+          { status: 502 },
+        );
+      }
       const result = await res.json();
-      detections     = result.detections     ?? [];
-      ppeViolations  = result.ppe_violations  ?? [];
-      zoneViolations = result.zone_violations ?? [];
-      inventory      = result.inventory       ?? summarizeInventory(detections);
+      detections        = result.detections         ?? [];
+      ppeViolations     = result.ppe_violations     ?? [];
+      zoneViolations    = result.zone_violations    ?? [];
+      inventory         = result.inventory          ?? {};
+      complianceSummary = result.compliance_summary ?? null;
     } else {
-      // Demo mock
-      detections    = MOCK_DETECTIONS;
-      inventory     = summarizeInventory(detections);
-      ppeViolations = detections
-        .filter(d => isPpeViolation(d.class))
-        .map(d => ({
-          class:       d.class,
-          bbox:        d.bbox,
-          confidence:  d.confidence,
-          alert_level: VIOLATION_SEVERITY[d.class],
-        }));
+      // Demo mock — base-class detections with pre-derived PPE violations.
+      detections        = MOCK_DETECTIONS;
+      inventory         = MOCK_INVENTORY;
+      ppeViolations     = MOCK_PPE_VIOLATIONS;
+      complianceSummary = MOCK_COMPLIANCE_SUMMARY;
 
-      if (hasSupabase) {
-        const supabase = getSupabase();
-        const { data: zones } = await supabase
-          .from("warehouse_zones")
-          .select("*")
-          .eq("camera_id", cameraId)
-          .eq("is_active", true);
+      if (hasSupabase && !SKIP_PERSIST) {
+        try {
+          const supabase = getSupabase();
+          const { data: zones } = await supabase
+            .from("warehouse_zones")
+            .select("*")
+            .eq("camera_id", cameraId)
+            .eq("is_active", true);
 
-        if (zones) {
-          for (const det of detections) {
-            for (const zone of zones) {
-              if (zone.object_class !== det.class) continue;
-              if (zone.rule_type   !== "RESTRICTED") continue;
-              const poly = typeof zone.polygon === "string"
-                ? JSON.parse(zone.polygon) : zone.polygon;
-              if (pointInPolygon(det.cx, det.cy, poly)) {
-                zoneViolations.push({
-                  class:       det.class,
-                  zone_id:     zone.id,
-                  zone_name:   zone.zone_name,
-                  alert_level: zone.alert_level,
-                  bbox:        det.bbox,
-                  confidence:  det.confidence,
-                });
+          if (zones) {
+            for (const det of detections) {
+              for (const zone of zones) {
+                if (zone.object_class !== det.class) continue;
+                if (zone.rule_type   !== "RESTRICTED") continue;
+                const poly = typeof zone.polygon === "string"
+                  ? JSON.parse(zone.polygon) : zone.polygon;
+                if (pointInPolygon(det.cx, det.cy, poly)) {
+                  zoneViolations.push({
+                    class:       det.class,
+                    zone_id:     zone.id,
+                    zone_name:   zone.zone_name,
+                    alert_level: zone.alert_level,
+                    bbox:        det.bbox,
+                    confidence:  det.confidence,
+                  });
+                }
               }
             }
           }
+        } catch (err: any) {
+          console.warn("Zone lookup skipped:", err?.message ?? err);
         }
       }
     }
@@ -172,29 +222,42 @@ export async function POST(req: NextRequest) {
     // Merge for legacy `violations` key (so older consumers still see something).
     const violations = [...ppeViolations, ...zoneViolations];
 
-    // 3. Save to detection_logs (skip if not configured)
-    if (hasSupabase) {
-      const supabase = getSupabase();
-      await supabase.from("detection_logs").insert({
-        camera_id:        cameraId,
-        image_url:        imageUrl,
-        detections,
-        violations,
-        inventory,
-        total_objects:    detections.length,
-        total_violations: violations.length,
-      });
+    // 3. Save to detection_logs (skip if not configured or persistence disabled).
+    // Non-fatal on error — same reasoning as the upload above. Phase-2:
+    // compliance_summary is persisted nested inside the inventory JSONB so we
+    // don't need a column-level migration to read it back.
+    const inventoryForLog = complianceSummary
+      ? { ...inventory, compliance_summary: complianceSummary }
+      : inventory;
+
+    if (hasSupabase && !SKIP_PERSIST) {
+      try {
+        const supabase = getSupabase();
+        const { error: insertError } = await supabase.from("detection_logs").insert({
+          camera_id:        cameraId,
+          image_url:        imageUrl,
+          detections,
+          violations,
+          inventory:        inventoryForLog,
+          total_objects:    detections.length,
+          total_violations: violations.length,
+        });
+        if (insertError) throw insertError;
+      } catch (err: any) {
+        console.warn("Log insert skipped:", err?.message ?? err);
+      }
     }
 
     return NextResponse.json({
-      image_url:        imageUrl,
+      image_url:          imageUrl,
       detections,
-      ppe_violations:   ppeViolations,
-      zone_violations:  zoneViolations,
+      ppe_violations:     ppeViolations,
+      zone_violations:    zoneViolations,
       violations,                       // legacy: PPE + zone merged
       inventory,
-      total_objects:    detections.length,
-      total_violations: violations.length,
+      compliance_summary: complianceSummary,
+      total_objects:      detections.length,
+      total_violations:   violations.length,
     });
 
   } catch (err: any) {

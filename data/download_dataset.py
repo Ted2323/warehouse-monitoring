@@ -2,14 +2,14 @@
 STEP 1 — DATA COLLECTION
 Downloads the warehouse PPE + asset-status dataset from Roboflow.
 
-The new dataset has 8 classes (see ml/classes.py:CLASS_NAMES):
-    worker_with_helmet, worker_no_helmet,
-    worker_with_reflective, worker_no_reflective_vest,
-    pallet_filled, pallet_empty,
-    forklift_with_boxes, forklift_no_carry
+The dataset has 6 compositional base classes (see ml/classes.py:CLASS_NAMES):
+    worker, helmet, vest, pallet, box, forklift
+
+PPE compliance and asset state are NOT model classes — they are derived from
+bbox association at inference time (ml/associate.py).
 
 The data.yaml shipped with the dataset MUST declare these names in this exact
-order — class IDs come from YAML order.
+order — class IDs come from YAML order. Mismatch silently corrupts inference.
 """
 
 import os
@@ -25,9 +25,9 @@ def download_dataset(api_key: str, output_dir: str = "./dataset"):
     rf = Roboflow(api_key=api_key)
 
     # TODO: replace with the new PPE + asset-status dataset coordinates.
-    # Expected classes (in this order): worker_with_helmet, worker_no_helmet,
-    # worker_with_reflective, worker_no_reflective_vest, pallet_filled,
-    # pallet_empty, forklift_with_boxes, forklift_no_carry.
+    # Expected classes (in this order): worker, helmet, vest, pallet, box,
+    # forklift. Compliance and asset state are derived from bbox association
+    # at inference time — not modeled directly.
     workspace_slug = os.environ.get("ROBOFLOW_WORKSPACE", "TODO_WORKSPACE_SLUG")
     project_slug   = os.environ.get("ROBOFLOW_PROJECT",   "TODO_PROJECT_SLUG")
     version_num    = int(os.environ.get("ROBOFLOW_VERSION", "1"))

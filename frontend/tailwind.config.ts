@@ -25,9 +25,10 @@ const config: Config = {
           hover:   "var(--accent-hover)",
           fg:      "var(--accent-fg)",
         },
-        success: "var(--success)",
-        warning: "var(--warning)",
-        danger:  "var(--danger)",
+        success:  "var(--success)",
+        warning:  "var(--warning)",
+        danger:   "var(--danger)",
+        critical: "var(--critical)",
       },
       fontFamily: {
         // CSS variables come from next/font/google in app/layout.tsx.
