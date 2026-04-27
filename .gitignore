@@ -31,3 +31,8 @@ venv/
 Thumbs.db
 .vscode/*.code-snippets
 *.swp
+
+# ── Local verification / preview artifacts ───────────────────
+# .tmp/ holds throwaway HTML mocks + screenshots used to verify visual
+# contracts during development. Not part of the project.
+.tmp/

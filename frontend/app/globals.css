@@ -27,6 +27,11 @@
   --success:       #3F7D58;
   --warning:       #B07F2A;
   --danger:        #A93B2C;
+
+  /* Phase-2: critical sits above danger and is reserved for compound PPE
+     failures (worker_unsafe). Deeper red so the eye locks onto it first. */
+  --critical:      #7A0E1F;
+  --critical-bg:   #7A0E1F22;
 }
 
 .dark {
@@ -48,6 +53,10 @@
   --success:       #5DA078;
   --warning:       #D1A24A;
   --danger:        #C8584A;
+
+  /* Critical — bright/alarming on dark, sits above --danger. */
+  --critical:      #E45A4A;
+  --critical-bg:   #E45A4A33;
 }
 
 * {
@@ -89,3 +98,13 @@ body {
 
 /* ── Spin animation ─────────────────────────────────────── */
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Phase-3: critical bbox pulse ────────────────────────── */
+/* Applied by BBoxOverlay to <rect> elements whose detection bbox matches
+   a worker_unsafe (critical) violation. Oscillates stroke-opacity so the
+   bbox visually pulses without distorting the overlay layout. */
+@keyframes critical-pulse {
+  0%, 100% { stroke-opacity: 0.4; }
+  50%      { stroke-opacity: 1.0; }
+}
+.bbox-critical { animation: critical-pulse 0.7s ease-in-out infinite; }

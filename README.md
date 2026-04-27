@@ -15,19 +15,52 @@ Upload image / video
         ↓
 Frames extracted (video: every 2s via canvas)
         ↓
-YOLOv8 detects 8 classes (see ml/classes.py):
-  worker_with_helmet · worker_no_helmet
-  worker_with_reflective · worker_no_reflective_vest
-  pallet_filled · pallet_empty
-  forklift_with_boxes · forklift_no_carry
+YOLOv8 detects 6 base classes (see ml/classes.py):
+  worker · helmet · vest · pallet · box · forklift
         ↓
-Classification-driven PPE violations (primary)
+Bbox-association derives state in the same frame:
+  helmet inside worker (upper third) → compliant; else partial/unsafe
+  vest IoU ≥ 0.15 with worker        → compliant; else partial/unsafe
+  box inside pallet                  → pallet filled, else empty
+  worker associated with forklift    → operating, else idle  (phase 2)
+        ↓
+Association-driven PPE violations (one per worker, by precedence)
 + optional zone overlap (secondary)
         ↓
-Violations + inventory snapshot logged to Supabase
+Violations + inventory + compliance summary logged to Supabase
         ↓
 Dashboard — KPIs, Safety Violations feed, audit history
 ```
+
+## Violation taxonomy
+
+PPE violations are mutually exclusive — each worker emits **at most one**
+entry, picked by precedence:
+
+| Class              | Condition                                    | Severity   |
+|--------------------|----------------------------------------------|------------|
+| `worker_unsafe`    | neither helmet nor vest associated           | `critical` |
+| `worker_no_helmet` | vest associated but no helmet                | `danger`   |
+| `worker_no_vest`   | helmet associated but no vest                | `danger`   |
+| _(no emission)_    | both associated                              | compliant  |
+
+`total_violations` therefore reads as the count of unsafe workers, not the
+count of PPE failures across workers × items.
+
+## Severity tiers
+
+`info < warning < danger < critical`
+
+| Tier       | Used for                                               |
+|------------|--------------------------------------------------------|
+| `info`     | informational zones (e.g. allowed forklift lane)       |
+| `warning`  | low-stakes zone events                                 |
+| `danger`   | single-PPE-item PPE failures (`worker_no_helmet`/`worker_no_vest`) |
+| `critical` | compound PPE failure (`worker_unsafe`) — phase 2       |
+
+The dashboard renders `critical` with a deeper red token (`--critical`),
+solid-fill chip, and an octagon icon so it locks the eye in a row of
+mixed-severity items.
 
 ---
 
@@ -116,16 +149,20 @@ Then set `DETECTION_SERVICE_URL=http://localhost:8000` in `frontend/.env.local`.
 
 ## Zone Rules (secondary signal)
 
-PPE violations are now classification-driven — any detection of
-`worker_no_helmet` or `worker_no_reflective_vest` is a violation on its own,
-no zone required. Zones are kept as an *optional* secondary signal: a worker
-without a vest who is *also* in a high-risk zone can be surfaced with higher
-severity. `object_class` must be one of the 8 names from `ml/classes.py`.
+PPE violations are association-driven — `worker_no_helmet` and `worker_no_vest`
+are derived server-side from helmet/vest detections inside a worker bbox (see
+`ml/associate.py`). They are NOT model classes; they appear only in the
+`ppe_violations` array of the API response.
+
+Zones are kept as an *optional* secondary signal that can flag a worker (or
+forklift) inside a restricted polygon. `object_class` must be one of the 6
+base names from `ml/classes.py` — derived strings like `worker_no_helmet`
+are not valid zone classes.
 
 | Zone | Object | Rule | Alert |
 |---|---|---|---|
-| Forklift Lane A | forklift_with_boxes | ALLOWED | info |
-| Forklift Lane A | worker_no_helmet | RESTRICTED | danger |
+| Forklift Lane A | forklift | ALLOWED | info |
+| Forklift Lane A | worker | RESTRICTED | danger |
 
 Edit zones in the `warehouse_zones` Supabase table.
 

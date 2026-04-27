@@ -2,11 +2,12 @@
 
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import {
   Upload, AlertTriangle, CheckCircle,
   Box, Truck, HardHat, Loader2, FileVideo, Image as ImageIcon,
   Clock, Shield, ChevronDown, ChevronUp, Download,
-  Scan, BarChart3, Package, LogOut,
+  Scan, BarChart3, Package, LogOut, Octagon,
 } from "lucide-react";
 import {
   CLASS_LABELS, VIOLATION_SEVERITY,
@@ -17,15 +18,17 @@ import { Card } from "@/components/Card";
 import { Button } from "@/components/Button";
 import { Chip } from "@/components/Chip";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { BBoxOverlay, type Detection, bboxKey } from "@/components/BBoxOverlay";
+import {
+  VideoPlayer,
+  type VideoFrame, type VideoSession, type VideoPlayerHandle,
+} from "@/components/VideoPlayer";
+import { LiveBurnIn } from "@/components/LiveBurnIn";
+import { AnimatedNumber } from "@/components/AnimatedNumber";
+import { ComplianceGauge } from "@/components/ComplianceGauge";
+import { Timeline, type TimelineEntry } from "@/components/Timeline";
 
 // ─── TYPES ───────────────────────────────────────────────────
-type Detection = {
-  class: string;
-  confidence: number;
-  bbox: [number, number, number, number];
-  cx: number;
-  cy: number;
-};
 type PpeViolation = {
   class: string;
   bbox: [number, number, number, number];
@@ -41,10 +44,19 @@ type ZoneViolation = {
 type Inventory = {
   pallets_filled: number;
   pallets_empty: number;
-  forklifts_carrying: number;
+  forklifts_operating: number;
   forklifts_idle: number;
   workers_total: number;
   workers_compliant: number;
+};
+type ComplianceSummary = {
+  workers_total: number;
+  workers_compliant: number;
+  workers_partial: number;
+  workers_unsafe: number;
+  critical_count: number;
+  danger_count: number;
+  warning_count: number;
 };
 type AuditEntry = {
   id: string;
@@ -54,73 +66,44 @@ type AuditEntry = {
   ppeViolations: PpeViolation[];
   zoneViolations: ZoneViolation[];
   inventory: Inventory;
+  complianceSummary?: ComplianceSummary;
   previewSrc: string;
   imageUrl?: string;
+  videoTimeSeconds?: number;
 };
 
 // ─── HELPERS ─────────────────────────────────────────────────
-// SVG strokes need real color values. Use CSS variables (no hex literals).
-const BBOX_STROKE: Record<string, string> = {
-  worker_with_helmet:        "var(--success)",
-  worker_with_reflective:    "var(--success)",
-  worker_no_helmet:          "var(--danger)",
-  worker_no_reflective_vest: "var(--danger)",
-  pallet_filled:             "var(--accent)",
-  pallet_empty:              "var(--fg-subtle)",
-  forklift_with_boxes:       "var(--warning)",
-  forklift_no_carry:         "var(--fg-muted)",
-};
-const FALLBACK_STROKE = "var(--fg-muted)";
-
 const EMPTY_INVENTORY: Inventory = {
   pallets_filled: 0, pallets_empty: 0,
-  forklifts_carrying: 0, forklifts_idle: 0,
+  forklifts_operating: 0, forklifts_idle: 0,
   workers_total: 0, workers_compliant: 0,
 };
 
-const ALERT_CHIP: Record<AlertLevel, "danger" | "warning" | "success"> = {
-  danger:  "danger",
-  warning: "warning",
-  info:    "success",
+// Phase-2: `critical` is a fourth severity tier above `danger`. Uses the new
+// "critical" Chip variant (solid fill, white text) so a worker_unsafe entry
+// is visually distinct from a row of danger/warning items.
+const ALERT_CHIP: Record<AlertLevel, "critical" | "danger" | "warning" | "success"> = {
+  critical: "critical",
+  danger:   "danger",
+  warning:  "warning",
+  info:     "success",
 };
 
 function topAlertOfPpe(v: PpeViolation[]): AlertLevel | null {
   if (!v.length) return null;
-  if (v.some(x => x.alert_level === "danger"))  return "danger";
-  if (v.some(x => x.alert_level === "warning")) return "warning";
+  if (v.some(x => x.alert_level === "critical")) return "critical";
+  if (v.some(x => x.alert_level === "danger"))   return "danger";
+  if (v.some(x => x.alert_level === "warning"))  return "warning";
   return "info";
 }
 
-// ─── BBOX OVERLAY ────────────────────────────────────────────
-function BBoxOverlay({ detections, naturalW, naturalH, displayW, displayH }: {
-  detections: Detection[];
-  naturalW: number; naturalH: number; displayW: number; displayH: number;
-}) {
-  const scaleX = displayW / naturalW;
-  const scaleY = displayH / naturalH;
-  return (
-    <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox={`0 0 ${displayW} ${displayH}`}>
-      {detections.map((det, i) => {
-        const [x1,y1,x2,y2] = det.bbox;
-        const sx = x1*scaleX, sy = y1*scaleY, sw = (x2-x1)*scaleX, sh = (y2-y1)*scaleY;
-        const isViol = isPpeViolation(det.class);
-        const stroke = BBOX_STROKE[det.class] ?? FALLBACK_STROKE;
-        const label  = `${CLASS_LABELS[det.class] ?? det.class} ${Math.round(det.confidence*100)}%`;
-        const labelW = label.length * 6.5 + 10;
-        return (
-          <g key={i}>
-            <rect x={sx} y={sy} width={sw} height={sh} fill="none"
-              stroke={stroke} strokeWidth={1.5} rx={2}
-              strokeDasharray={isViol ? "5,3" : undefined} />
-            <rect x={sx} y={Math.max(0, sy-20)} width={labelW} height={18} fill={stroke} rx={2} />
-            <text x={sx+5} y={Math.max(0, sy-20)+13} fill="white" fontSize={11} fontWeight={500} className="font-sans">
-              {label}
-            </text>
-          </g>
-        );
-      })}
-    </svg>
-  );
+// Phase-3 toast de-dupe window. A given violation key (class + bbox) can
+// re-toast after this many ms — keeps the dashboard reactive over a long
+// session without spamming when the same worker stays in frame.
+const TOAST_WINDOW_MS = 30_000;
+
+function violationKey(v: PpeViolation): string {
+  return `${v.class}:${v.bbox.join(",")}`;
 }
 
 // ─── AUDIT ROW ───────────────────────────────────────────────
@@ -178,13 +161,20 @@ function AuditRow({ entry, isActive, onClick }: { entry: AuditEntry; isActive: b
       </div>
       {expanded && totalV > 0 && (
         <div className="px-4 pb-3 pt-1 space-y-1.5 bg-bg-sunken/50 border-t border-border">
-          {entry.ppeViolations.map((v, i) => (
-            <div key={`p${i}`} className="flex items-center gap-2 text-xs">
-              <AlertTriangle size={10} className={v.alert_level === "danger" ? "text-danger" : "text-warning"} />
-              <span className="text-fg font-medium">{CLASS_LABELS[v.class] ?? v.class}</span>
-              <span className="text-fg-subtle uppercase tracking-wider">PPE</span>
-            </div>
-          ))}
+          {entry.ppeViolations.map((v, i) => {
+            const tone =
+              v.alert_level === "critical" ? "text-critical" :
+              v.alert_level === "danger"   ? "text-danger"   :
+              v.alert_level === "warning"  ? "text-warning"  : "text-fg-muted";
+            const Icon = v.alert_level === "critical" ? Octagon : AlertTriangle;
+            return (
+              <div key={`p${i}`} className="flex items-center gap-2 text-xs">
+                <Icon size={10} className={tone} />
+                <span className="text-fg font-medium">{CLASS_LABELS[v.class] ?? v.class}</span>
+                <span className="text-fg-subtle uppercase tracking-wider">PPE</span>
+              </div>
+            );
+          })}
           {entry.zoneViolations.map((v, i) => (
             <div key={`z${i}`} className="flex items-center gap-2 text-xs">
               <AlertTriangle size={10} className="text-warning" />
@@ -202,15 +192,16 @@ function AuditRow({ entry, isActive, onClick }: { entry: AuditEntry; isActive: b
 // ─── KPI CARD ────────────────────────────────────────────────
 function KpiCard({ icon, label, primary, secondary, tone = "neutral" }: {
   icon: React.ReactNode; label: string;
-  primary: { value: number | string; suffix?: string };
-  secondary?: { value: number | string; suffix?: string };
-  tone?: "danger" | "success" | "neutral" | "accent";
+  primary: { value: React.ReactNode; suffix?: string };
+  secondary?: { value: React.ReactNode; suffix?: string };
+  tone?: "critical" | "danger" | "success" | "neutral" | "accent";
 }) {
   const toneText = {
-    danger:  "text-danger",
-    success: "text-success",
-    accent:  "text-accent",
-    neutral: "text-fg",
+    critical: "text-critical",
+    danger:   "text-danger",
+    success:  "text-success",
+    accent:   "text-accent",
+    neutral:  "text-fg",
   }[tone];
 
   return (
@@ -238,16 +229,24 @@ function KpiCard({ icon, label, primary, secondary, tone = "neutral" }: {
 
 // ─── MAIN PAGE ───────────────────────────────────────────────
 export default function DashboardPage() {
-  const [dragging,    setDragging]    = useState(false);
-  const [loading,     setLoading]     = useState(false);
-  const [auditLog,    setAuditLog]    = useState<AuditEntry[]>([]);
-  const [activeEntry, setActiveEntry] = useState<AuditEntry | null>(null);
-  const [imgSize,     setImgSize]     = useState({ w: 640, h: 480 });
-  const [error,       setError]       = useState<string | null>(null);
-  const [progress,    setProgress]    = useState<{ current: number; total: number } | null>(null);
+  const [dragging,     setDragging]    = useState(false);
+  const [loading,      setLoading]     = useState(false);
+  const [auditLog,     setAuditLog]    = useState<AuditEntry[]>([]);
+  const [activeEntry,  setActiveEntry] = useState<AuditEntry | null>(null);
+  const [videoSession, setVideoSession] = useState<VideoSession | null>(null);
+  const [imgSize,      setImgSize]     = useState({ w: 640, h: 480 });
+  const [error,        setError]       = useState<string | null>(null);
+  const [progress,     setProgress]    = useState<{ current: number; total: number } | null>(null);
+  // Phase-3: ring buffer of severity ticks for the live timeline.
+  const [timeline,     setTimeline]    = useState<TimelineEntry[]>([]);
 
-  const imgRef       = useRef<HTMLImageElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const imgRef         = useRef<HTMLImageElement>(null);
+  const fileInputRef   = useRef<HTMLInputElement>(null);
+  const videoPlayerRef = useRef<VideoPlayerHandle>(null);
+  // Phase-3: violationKey → last-toasted timestamp (ms). Used by the
+  // sliding-window de-dupe so the same worker_unsafe re-toasts after
+  // TOAST_WINDOW_MS rather than going silent for the rest of the session.
+  const seenToastsRef  = useRef<Map<string, number>>(new Map());
   const CAMERA_ID    = "a0000000-0000-0000-0000-000000000001";
 
   const router   = useRouter();
@@ -276,16 +275,22 @@ export default function DashboardPage() {
         });
       }
     }
+    // Phase-2 persistence: compliance_summary is nested inside the inventory
+    // JSONB. Pre-phase-2 rows don't have it — leave undefined.
+    const inventoryRaw = (log.inventory ?? EMPTY_INVENTORY) as any;
+    const complianceSummary: ComplianceSummary | undefined = inventoryRaw?.compliance_summary;
+
     return {
-      id:             log.id,
-      timestamp:      new Date(log.detected_at),
-      source:         log.image_url?.split("/").pop() ?? "archived",
-      detections:     log.detections ?? [],
+      id:                log.id,
+      timestamp:         new Date(log.detected_at),
+      source:            log.image_url?.split("/").pop() ?? "archived",
+      detections:        log.detections ?? [],
       ppeViolations,
       zoneViolations,
-      inventory:      (log.inventory ?? EMPTY_INVENTORY) as Inventory,
-      previewSrc:     log.image_url ?? "",
-      imageUrl:       log.image_url,
+      inventory:         inventoryRaw as Inventory,
+      complianceSummary,
+      previewSrc:        log.image_url ?? "",
+      imageUrl:          log.image_url,
     };
   }, []);
 
@@ -299,6 +304,41 @@ export default function DashboardPage() {
       .catch(() => {});
   }, [adaptLog]);
 
+  // Phase-3 helper — fire toasts for newly-seen violations and push a tick
+  // onto the live timeline. Skipped during /api/logs rehydrate so historical
+  // entries don't blast 50 toasts on first paint.
+  const onNewDetection = useCallback((entry: AuditEntry) => {
+    const now = Date.now();
+
+    // Sliding-window de-dupe — drop any seen-key whose stamp is older than
+    // TOAST_WINDOW_MS so the same violation can re-toast in a long session.
+    const seen = seenToastsRef.current;
+    for (const [k, ts] of seen) if (now - ts > TOAST_WINDOW_MS) seen.delete(k);
+
+    for (const v of entry.ppeViolations) {
+      const key = violationKey(v);
+      if (seen.has(key)) continue;
+      seen.set(key, now);
+      const label = CLASS_LABELS[v.class] ?? v.class;
+      const description = `Camera A · ${entry.timestamp.toLocaleTimeString()}`;
+      if (v.alert_level === "critical") {
+        toast.error(label, { description, duration: 5000 });
+      } else if (v.alert_level === "danger") {
+        toast.warning(label, { description, duration: 4000 });
+      }
+      // info / warning PPE shouldn't happen in phase 2+, but harmless if it does.
+    }
+
+    // Push timeline tick — color = highest PPE severity in this frame, or
+    // "clear" when nothing fired. Zone violations don't drive the timeline
+    // since they're a secondary signal.
+    const top = topAlertOfPpe(entry.ppeViolations);
+    setTimeline(prev => [
+      ...prev.slice(-119),  // hard cap so the buffer never grows unbounded
+      { id: entry.id, t: now, maxSeverity: top ?? "clear" },
+    ]);
+  }, []);
+
   const processImage = useCallback(async (file: File | Blob, sourceName: string): Promise<AuditEntry> => {
     const previewSrc = URL.createObjectURL(file);
     const fd = new FormData();
@@ -308,42 +348,47 @@ export default function DashboardPage() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Detection failed");
     return {
-      id:             crypto.randomUUID(),
-      timestamp:      new Date(),
-      source:         sourceName,
-      detections:     data.detections ?? [],
-      ppeViolations:  data.ppe_violations  ?? [],
-      zoneViolations: data.zone_violations ?? [],
-      inventory:      (data.inventory ?? EMPTY_INVENTORY) as Inventory,
+      id:                crypto.randomUUID(),
+      timestamp:         new Date(),
+      source:            sourceName,
+      detections:        data.detections ?? [],
+      ppeViolations:     data.ppe_violations  ?? [],
+      zoneViolations:    data.zone_violations ?? [],
+      inventory:         (data.inventory ?? EMPTY_INVENTORY) as Inventory,
+      complianceSummary: data.compliance_summary as ComplianceSummary | undefined,
       previewSrc,
-      imageUrl:       data.image_url,
+      imageUrl:          data.image_url,
     };
   }, []);
 
-  const extractFrames = useCallback((videoFile: File, intervalSec = 2): Promise<{ blob: Blob; label: string }[]> =>
-    new Promise((resolve, reject) => {
-      const video = document.createElement("video");
-      video.src   = URL.createObjectURL(videoFile);
-      video.muted = true;
-      video.addEventListener("loadedmetadata", async () => {
-        const canvas = document.createElement("canvas");
-        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-        const ctx = canvas.getContext("2d")!;
-        const times: number[] = [];
-        for (let t = 0; t < video.duration; t += intervalSec) times.push(+t.toFixed(1));
-        const frames: { blob: Blob; label: string }[] = [];
-        for (const t of times) {
-          video.currentTime = t;
-          await new Promise<void>(r => video.addEventListener("seeked", () => r(), { once: true }));
-          ctx.drawImage(video, 0, 0);
-          const blob = await new Promise<Blob>(r => canvas.toBlob(b => r(b!), "image/jpeg", 0.85));
-          frames.push({ blob, label: `frame ${t}s` });
-        }
-        URL.revokeObjectURL(video.src);
-        resolve(frames);
-      });
-      video.addEventListener("error", reject);
-    }), []);
+  const extractFrames = useCallback(
+    (videoFile: File, intervalSec = 2): Promise<{ frames: { blob: Blob; t: number }[]; duration: number }> =>
+      new Promise((resolve, reject) => {
+        const video = document.createElement("video");
+        video.src   = URL.createObjectURL(videoFile);
+        video.muted = true;
+        video.addEventListener("loadedmetadata", async () => {
+          const canvas = document.createElement("canvas");
+          canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+          const ctx = canvas.getContext("2d")!;
+          const duration = video.duration;
+          const times: number[] = [];
+          for (let t = 0; t < duration; t += intervalSec) times.push(+t.toFixed(1));
+          const frames: { blob: Blob; t: number }[] = [];
+          for (const t of times) {
+            video.currentTime = t;
+            await new Promise<void>(r => video.addEventListener("seeked", () => r(), { once: true }));
+            ctx.drawImage(video, 0, 0);
+            const blob = await new Promise<Blob>(r => canvas.toBlob(b => r(b!), "image/jpeg", 0.85));
+            frames.push({ blob, t });
+          }
+          URL.revokeObjectURL(video.src);
+          resolve({ frames, duration });
+        });
+        video.addEventListener("error", reject);
+      }),
+    [],
+  );
 
   const handleFile = useCallback(async (file: File) => {
     const isImage = file.type.startsWith("image/");
@@ -352,25 +397,58 @@ export default function DashboardPage() {
     setError(null); setLoading(true); setProgress(null);
     try {
       if (isImage) {
+        // Switching back to image: drop any active video session so its blob URL
+        // is revoked by the cleanup effect.
+        setVideoSession(null);
         const entry = await processImage(file, file.name);
         setAuditLog(prev => [entry, ...prev]);
         setActiveEntry(entry);
+        onNewDetection(entry);
       } else {
-        const frames = await extractFrames(file, 2);
+        // Hide static viewer + previous video while we analyze.
+        setActiveEntry(null);
+        setVideoSession(null);
+
+        const url = URL.createObjectURL(file);
+        const { frames, duration } = await extractFrames(file, 2);
         setProgress({ current: 0, total: frames.length });
+        const sessionFrames: VideoFrame[] = [];
+
         for (let i = 0; i < frames.length; i++) {
-          const entry = await processImage(frames[i].blob, `${file.name} — ${frames[i].label}`);
+          const t = frames[i].t;
+          const entry = await processImage(frames[i].blob, `${file.name} — frame ${t}s`);
+          entry.videoTimeSeconds = t;
           setAuditLog(prev => [entry, ...prev]);
-          setActiveEntry(entry);
+          onNewDetection(entry);
+          sessionFrames.push({
+            t,
+            detections:    entry.detections,
+            ppeViolations: entry.ppeViolations,
+            zoneViolations: entry.zoneViolations,
+            inventory:     entry.inventory,
+          });
           setProgress({ current: i + 1, total: frames.length });
         }
+
+        const sessionDuration = Number.isFinite(duration) && duration > 0
+          ? duration
+          : (sessionFrames.length ? sessionFrames[sessionFrames.length - 1].t + 2 : 0);
+
+        setVideoSession({ url, duration: sessionDuration, frames: sessionFrames, filename: file.name });
       }
     } catch (e: any) {
       setError(e.message);
     } finally {
       setLoading(false); setProgress(null);
     }
-  }, [processImage, extractFrames]);
+  }, [processImage, extractFrames, onNewDetection]);
+
+  // Revoke the previous video blob URL when the session changes or the page unmounts.
+  useEffect(() => {
+    if (!videoSession) return;
+    const url = videoSession.url;
+    return () => { URL.revokeObjectURL(url); };
+  }, [videoSession]);
 
   const exportCSV = useCallback((entries: AuditEntry[]) => {
     const header = "timestamp,source,objects,ppe_violations,zone_violations,alert_level,details";
@@ -397,21 +475,47 @@ export default function DashboardPage() {
   const kpis = useMemo(() => {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     const recent = auditLog.filter(e => e.timestamp.getTime() >= cutoff);
-    const ppe24h = recent.reduce((s, e) => s + e.ppeViolations.length, 0);
+    const ppe24h      = recent.reduce((s, e) => s + e.ppeViolations.length, 0);
+    const critical24h = recent.reduce(
+      (s, e) => s + e.ppeViolations.filter(v => v.alert_level === "critical").length, 0);
     const latest = auditLog[0]?.inventory ?? EMPTY_INVENTORY;
     return {
       ppe24h,
-      pallets:   { filled: latest.pallets_filled,     empty: latest.pallets_empty },
-      forklifts: { carrying: latest.forklifts_carrying, idle: latest.forklifts_idle },
+      critical24h,
+      pallets:   { filled: latest.pallets_filled,         empty: latest.pallets_empty },
+      forklifts: { operating: latest.forklifts_operating, idle: latest.forklifts_idle },
     };
   }, [auditLog]);
 
+  const criticalCount   = auditLog.filter(e => topAlertOfPpe(e.ppeViolations) === "critical").length;
   const dangerCount     = auditLog.filter(e => topAlertOfPpe(e.ppeViolations) === "danger").length;
   const warningCount    = auditLog.filter(e => topAlertOfPpe(e.ppeViolations) === "warning").length;
   const totalObjects    = auditLog.reduce((s, e) => s + e.detections.length, 0);
   const totalViolations = auditLog.reduce(
     (s, e) => s + e.ppeViolations.length + e.zoneViolations.length, 0,
   );
+
+  // Phase-3 — gauge inputs come from the latest entry's compliance_summary
+  // (server-derived) or fall back to the inventory roll-up. Empty state is
+  // workers_total=0 → gauge handles that internally.
+  const gaugeData = useMemo(() => {
+    const latest = auditLog[0];
+    const summary = latest?.complianceSummary;
+    if (summary) return { total: summary.workers_total, compliant: summary.workers_compliant };
+    const inv = latest?.inventory ?? EMPTY_INVENTORY;
+    return { total: inv.workers_total, compliant: inv.workers_compliant };
+  }, [auditLog]);
+
+  // Phase-3 — bbox keys for the active static-image entry's critical workers
+  // so the overlay can pulse the right rects.
+  const activeCriticalBboxes = useMemo(() => {
+    if (!activeEntry) return new Set<string>();
+    return new Set(
+      activeEntry.ppeViolations
+        .filter(v => v.alert_level === "critical")
+        .map(v => bboxKey(v.bbox)),
+    );
+  }, [activeEntry]);
 
   return (
     <div className="min-h-screen">
@@ -423,6 +527,12 @@ export default function DashboardPage() {
           <span className="text-xs text-fg-subtle">PPE · Asset Status</span>
           <div className="flex-1" />
           <span className="text-xs text-fg-muted">{auditLog.length} entries</span>
+          {criticalCount > 0 && (
+            <Chip variant="critical">
+              <Octagon size={10} className="shrink-0" />
+              {criticalCount} critical
+            </Chip>
+          )}
           {dangerCount > 0 && (
             <Chip variant="danger">{dangerCount} danger</Chip>
           )}
@@ -439,26 +549,41 @@ export default function DashboardPage() {
       {/* ── MAIN ── */}
       <main className="px-8 py-6 max-w-[1320px] mx-auto">
 
+        {/* Phase-3: compliance gauge sits above the KPI row so the overall
+            "are we safe right now?" read is the first thing the eye lands on. */}
+        <div className="mb-4">
+          <ComplianceGauge
+            workersTotal={gaugeData.total}
+            workersCompliant={gaugeData.compliant}
+          />
+        </div>
+
         {/* KPI ROW */}
         <div className="grid grid-cols-3 gap-4 mb-6">
           <KpiCard
-            icon={<HardHat size={15} />}
+            icon={kpis.critical24h > 0 ? <Octagon size={15} /> : <HardHat size={15} />}
             label="PPE violations · 24h"
-            primary={{ value: kpis.ppe24h, suffix: kpis.ppe24h === 1 ? "event" : "events" }}
-            tone={kpis.ppe24h > 0 ? "danger" : "success"}
+            primary={{ value: <AnimatedNumber value={kpis.ppe24h} />,
+                       suffix: kpis.ppe24h === 1 ? "event" : "events" }}
+            secondary={kpis.critical24h > 0
+              ? { value: <AnimatedNumber value={kpis.critical24h} />, suffix: "critical" }
+              : undefined}
+            tone={kpis.critical24h > 0 ? "critical"
+                : kpis.ppe24h     > 0 ? "danger"
+                : "success"}
           />
           <KpiCard
             icon={<Package size={15} />}
             label="Pallets"
-            primary={{ value: kpis.pallets.filled, suffix: "filled" }}
-            secondary={{ value: kpis.pallets.empty, suffix: "empty" }}
+            primary={{   value: <AnimatedNumber value={kpis.pallets.filled} />, suffix: "filled" }}
+            secondary={{ value: <AnimatedNumber value={kpis.pallets.empty} />,  suffix: "empty"  }}
             tone="accent"
           />
           <KpiCard
             icon={<Truck size={15} />}
             label="Forklifts"
-            primary={{ value: kpis.forklifts.carrying, suffix: "carrying" }}
-            secondary={{ value: kpis.forklifts.idle, suffix: "idle" }}
+            primary={{   value: <AnimatedNumber value={kpis.forklifts.operating} />, suffix: "operating" }}
+            secondary={{ value: <AnimatedNumber value={kpis.forklifts.idle} />,      suffix: "idle"      }}
             tone="neutral"
           />
         </div>
@@ -516,20 +641,31 @@ export default function DashboardPage() {
               </Card>
             )}
 
-            {/* Frame viewer */}
-            {activeEntry?.previewSrc && (
+            {/* Frame viewer — video player when a video session is loaded, else static image */}
+            {videoSession ? (
+              <VideoPlayer ref={videoPlayerRef} session={videoSession} />
+            ) : activeEntry?.previewSrc ? (
               <Card className="overflow-hidden">
-                <div className="relative">
+                {/* ring-1 white/10 mirrors VideoPlayer's "monitoring station"
+                    border so both viewer surfaces feel uniform. */}
+                <div className="relative ring-1 ring-white/10">
                   <img ref={imgRef} src={activeEntry.previewSrc} alt="Detection frame"
                     onLoad={() => { if (imgRef.current) setImgSize({ w: imgRef.current.naturalWidth, h: imgRef.current.naturalHeight }); }}
                     className="w-full block max-h-[520px] object-contain bg-bg-sunken" />
                   {imgRef.current && (
                     <BBoxOverlay
                       detections={activeEntry.detections}
+                      violations={activeEntry.ppeViolations}
+                      criticalBboxes={activeCriticalBboxes}
                       naturalW={imgSize.w} naturalH={imgSize.h}
                       displayW={imgRef.current.offsetWidth} displayH={imgRef.current.offsetHeight}
                     />
                   )}
+
+                  {/* Phase-3: same LIVE/timestamp burn-in the VideoPlayer uses
+                      so a still-image viewer also reads as "monitoring". */}
+                  <LiveBurnIn />
+
                   {loading && !progress && (
                     <div className="absolute inset-0 flex items-center justify-center gap-3 bg-bg/70">
                       <Loader2 size={22} className="text-accent" style={{ animation: "spin 1s linear infinite" }} />
@@ -541,10 +677,7 @@ export default function DashboardPage() {
                   </div>
                 </div>
               </Card>
-            )}
-
-            {/* Empty / loading state */}
-            {!activeEntry && (
+            ) : (
               <Card className="flex flex-col items-center justify-center gap-3 py-16">
                 <div className="w-14 h-14 rounded-lg flex items-center justify-center bg-bg-sunken border border-border">
                   {loading
@@ -560,6 +693,10 @@ export default function DashboardPage() {
               </Card>
             )}
 
+            {/* Phase-3 — live severity timeline. Always visible; empty
+                strip is the steady "no scans yet" state. */}
+            <Timeline entries={timeline} />
+
             {/* Error */}
             {error && (
               <div className="px-4 py-3 rounded text-sm flex items-center gap-2 bg-danger/10 border border-danger/30 text-danger">
@@ -572,19 +709,34 @@ export default function DashboardPage() {
             {auditLog.length > 0 && (
               <div className="grid grid-cols-4 gap-3">
                 {[
-                  { icon: <BarChart3   size={14}/>, value: auditLog.length,  label: "Frames",     tone: "neutral" as const },
-                  { icon: <Box         size={14}/>, value: totalObjects,    label: "Objects",    tone: "neutral" as const },
-                  { icon: <AlertTriangle size={14}/>, value: totalViolations, label: "Violations", tone: totalViolations ? "danger" as const : "success" as const },
-                  { icon: <Shield      size={14}/>, value: dangerCount,     label: "Danger",     tone: dangerCount ? "danger" as const : "neutral" as const },
+                  { icon: <BarChart3     size={14}/>, value: auditLog.length,  label: "Frames",     tone: "neutral" as const },
+                  { icon: <Box           size={14}/>, value: totalObjects,    label: "Objects",    tone: "neutral" as const },
+                  { icon: <AlertTriangle size={14}/>, value: totalViolations, label: "Violations",
+                    tone: criticalCount   ? "critical" as const
+                        : totalViolations ? "danger"   as const
+                        : "success"       as const },
+                  { icon: criticalCount > 0 ? <Octagon size={14}/> : <Shield size={14}/>,
+                    value: criticalCount || dangerCount,
+                    label: criticalCount ? "Critical" : "Danger",
+                    tone: criticalCount ? "critical" as const
+                        : dangerCount   ? "danger"   as const
+                        : "neutral"     as const },
                 ].map(({ icon, value, label, tone }) => {
-                  const toneText = { danger: "text-danger", success: "text-success", neutral: "text-fg" }[tone];
+                  const toneText = {
+                    critical: "text-critical",
+                    danger:   "text-danger",
+                    success:  "text-success",
+                    neutral:  "text-fg",
+                  }[tone];
                   return (
                     <Card key={label} className="px-4 py-3 flex items-center gap-3">
                       <div className="w-8 h-8 rounded flex items-center justify-center shrink-0 bg-bg-sunken border border-border text-fg-muted">
                         {icon}
                       </div>
                       <div>
-                        <div className={`font-serif text-2xl leading-none ${toneText}`}>{value}</div>
+                        <div className={`font-serif text-2xl leading-none ${toneText}`}>
+                          <AnimatedNumber value={value} />
+                        </div>
                         <div className="text-xs text-fg-muted mt-0.5">{label}</div>
                       </div>
                     </Card>
@@ -610,7 +762,7 @@ export default function DashboardPage() {
                     <Button variant="ghost" size="sm" onClick={() => exportCSV(auditLog)}>
                       <Download size={11} /> Export
                     </Button>
-                    <Button variant="ghost" size="sm" onClick={() => { setAuditLog([]); setActiveEntry(null); }}>
+                    <Button variant="ghost" size="sm" onClick={() => { setAuditLog([]); setActiveEntry(null); setVideoSession(null); }}>
                       Clear
                     </Button>
                   </div>
@@ -628,14 +780,22 @@ export default function DashboardPage() {
               ) : auditLog.map(entry => (
                 <AuditRow key={entry.id} entry={entry}
                   isActive={activeEntry?.id === entry.id}
-                  onClick={() => setActiveEntry(entry)} />
+                  onClick={() => {
+                    if (videoSession && entry.videoTimeSeconds !== undefined) {
+                      videoPlayerRef.current?.seek(entry.videoTimeSeconds);
+                    } else {
+                      setActiveEntry(entry);
+                    }
+                  }} />
               ))}
             </div>
 
             {auditLog.length > 0 && (
               <div className="px-5 py-3 flex items-center justify-between border-t border-border">
                 <span className="text-xs text-fg-muted">{auditLog.length} scans total</span>
-                <span className={`text-xs font-medium ${totalViolations > 0 ? "text-danger" : "text-success"}`}>
+                <span className={`text-xs font-medium ${
+                  criticalCount   > 0 ? "text-critical" :
+                  totalViolations > 0 ? "text-danger"   : "text-success"}`}>
                   {totalViolations > 0 ? `${totalViolations} violations` : "All clear"}
                 </span>
               </div>

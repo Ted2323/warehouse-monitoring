@@ -18,10 +18,14 @@ CREATE TABLE cameras (
 );
 
 -- ─── ZONES (secondary signal) ───────────────────────────────
--- Zones are no longer the primary violation source — PPE is classification-driven.
--- We keep zones for optional severity boosts (e.g. a worker without a vest who
--- is also inside a high-risk zone) and for the dashboard's zone editor overlay.
--- `object_class` must match a value from ml/classes.py:CLASS_NAMES.
+-- Zones are no longer the primary violation source — PPE is association-driven
+-- (worker_no_helmet / worker_no_vest are derived from helmet/vest detections
+-- inside a worker bbox; see ml/associate.py).
+-- We keep zones for optional severity boosts (e.g. a worker inside a high-risk
+-- zone) and for the dashboard's zone editor overlay.
+-- `object_class` must match a value from ml/classes.py:CLASS_NAMES — the *base*
+-- class set (worker, helmet, vest, pallet, box, forklift). Derived violation
+-- strings like 'worker_no_helmet' are NOT valid here.
 CREATE TABLE warehouse_zones (
     id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     camera_id    UUID REFERENCES cameras(id) ON DELETE CASCADE,
@@ -31,7 +35,7 @@ CREATE TABLE warehouse_zones (
                  CHECK (rule_type IN ('ALLOWED', 'RESTRICTED')),
     polygon      JSONB        NOT NULL,          -- [[x1,y1],[x2,y2],...]  pixel coords
     alert_level  VARCHAR(20)  DEFAULT 'warning'
-                 CHECK (alert_level IN ('info', 'warning', 'danger')),
+                 CHECK (alert_level IN ('info', 'warning', 'danger', 'critical')),
     color        VARCHAR(7)   DEFAULT '#FF0000', -- hex for UI overlay
     is_active    BOOLEAN DEFAULT true,
     created_at   TIMESTAMPTZ DEFAULT NOW()
@@ -44,16 +48,26 @@ CREATE TABLE detection_logs (
     image_url    TEXT,                           -- Supabase Storage path
     detected_at  TIMESTAMPTZ DEFAULT NOW(),
     detections   JSONB NOT NULL,
-    -- detections schema:
-    -- [{ class: "worker_no_helmet", confidence: 0.92, bbox: [x1,y1,x2,y2], cx: 320, cy: 240 }]
+    -- detections schema (raw model output — base classes only):
+    -- [{ class: "worker", confidence: 0.91, bbox: [x1,y1,x2,y2], cx: 320, cy: 240 }]
     violations   JSONB DEFAULT '[]',
-    -- violations schema (PPE + zone, merged):
+    -- violations schema (PPE + zone, merged). PPE classes are derived strings
+    -- (worker_no_helmet / worker_no_vest / worker_unsafe) — they do not appear
+    -- in `detections`. Each worker emits at most one PPE entry (precedence
+    -- chain in ml/detect.py:check_ppe_violations).
     -- PPE:  { class: "worker_no_helmet", bbox: [...], confidence: 0.92, alert_level: "danger" }
+    -- PPE:  { class: "worker_unsafe",    bbox: [...], confidence: 0.84, alert_level: "critical" }
     -- Zone: { class: "...", zone_id: "...", zone_name: "...", alert_level: "warning", bbox, confidence }
     inventory    JSONB DEFAULT '{}'::jsonb,
-    -- inventory schema:
-    -- { pallets_filled, pallets_empty, forklifts_carrying, forklifts_idle,
-    --   workers_total, workers_compliant }
+    -- inventory schema (phase 2):
+    -- { pallets_filled, pallets_empty, forklifts_operating, forklifts_idle,
+    --   workers_total, workers_compliant,
+    --   compliance_summary: { workers_total, workers_compliant, workers_partial,
+    --                         workers_unsafe, critical_count, danger_count,
+    --                         warning_count } }
+    -- `forklifts_operating` (worker-association) replaces an earlier
+    -- box-IoU based metric (see CLAUDE_CODE_BUSINESS_RULES.md §1).
+    -- compliance_summary is nested here so we don't need a separate column.
     total_objects    INT DEFAULT 0,
     total_violations INT DEFAULT 0
 );
@@ -66,15 +80,15 @@ VALUES (
     'Loading Bay, North Wall'
 );
 
--- Forklift lane: loaded forklifts ALLOWED here; any worker in this lane is RESTRICTED.
--- (Worker subclasses are still primary PPE-violation indicators on their own;
--- a zone hit is an *additional* signal that may bump severity in the UI.)
+-- Forklift lane: forklifts ALLOWED here; any worker in this lane is RESTRICTED.
+-- Zones gate on the *base* class only — PPE-specific severity (no helmet, no
+-- vest) comes from derived violations, not from zones.
 INSERT INTO warehouse_zones (camera_id, zone_name, object_class, rule_type, polygon, alert_level, color)
 VALUES
 (
     'a0000000-0000-0000-0000-000000000001',
     'Forklift Lane A',
-    'forklift_with_boxes',
+    'forklift',
     'ALLOWED',
     '[[50,200],[400,200],[400,480],[50,480]]',
     'info',
@@ -83,7 +97,7 @@ VALUES
 (
     'a0000000-0000-0000-0000-000000000001',
     'Forklift Lane A',
-    'worker_no_helmet',
+    'worker',
     'RESTRICTED',
     '[[50,200],[400,200],[400,480],[50,480]]',
     'danger',
@@ -107,11 +121,12 @@ SELECT
     l.detected_at,
     l.image_url,
     v->>'class'                AS violation_class,
+    v->>'alert_level'          AS alert_level,
     (v->>'confidence')::float  AS confidence,
     v->'bbox'                  AS bbox
 FROM detection_logs l,
      jsonb_array_elements(l.violations) v
-WHERE v->>'class' IN ('worker_no_helmet', 'worker_no_reflective_vest');
+WHERE v->>'class' IN ('worker_no_helmet', 'worker_no_vest', 'worker_unsafe');
 
 -- ─── APP USERS + ROLES ──────────────────────────────────────
 -- One row per Supabase auth user that is allowed into the app. Admins create

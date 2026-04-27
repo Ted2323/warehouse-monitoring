@@ -41,6 +41,7 @@ try:
         get_zones,
         run_inference,
         save_detection_log,
+        summarize_compliance,
         summarize_inventory,
     )
 except ImportError:
@@ -50,6 +51,7 @@ except ImportError:
         get_zones,
         run_inference,
         save_detection_log,
+        summarize_compliance,
         summarize_inventory,
     )
 
@@ -205,25 +207,28 @@ async def detect(req: DetectRequest):
         # 2. Run YOLOv8 inference
         detections = run_inference(tmp_path, req.model_path)
 
-        # 3. PPE (classification-driven) + inventory + zone (secondary)
-        ppe_violations = check_ppe_violations(detections)
-        inventory      = summarize_inventory(detections)
-        zones          = get_zones(req.camera_id)
-        zone_violations = check_violations(detections, zones)
+        # 3. PPE (association-driven) + inventory + zone (secondary)
+        ppe_violations     = check_ppe_violations(detections)
+        inventory          = summarize_inventory(detections)
+        compliance_summary = summarize_compliance(detections, ppe_violations)
+        zones              = get_zones(req.camera_id)
+        zone_violations    = check_violations(detections, zones)
 
         # 4. Persist
         save_detection_log(
             req.camera_id, req.image_url,
             detections, ppe_violations, zone_violations, inventory,
+            compliance_summary=compliance_summary,
         )
 
         return {
-            "detections":       detections,
-            "ppe_violations":   ppe_violations,
-            "zone_violations":  zone_violations,
-            "inventory":        inventory,
-            "total_objects":    len(detections),
-            "total_violations": len(ppe_violations) + len(zone_violations),
+            "detections":         detections,
+            "ppe_violations":     ppe_violations,
+            "zone_violations":    zone_violations,
+            "inventory":          inventory,
+            "compliance_summary": compliance_summary,
+            "total_objects":      len(detections),
+            "total_violations":   len(ppe_violations) + len(zone_violations),
         }
     finally:
         os.unlink(tmp_path)

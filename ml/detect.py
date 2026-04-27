@@ -15,22 +15,43 @@ try:
     # Loaded as part of the `ml` package (Docker / Render: `uvicorn ml.server:app`).
     from .classes import (
         CLASS_NAMES,
-        PPE_VIOLATION_CLASSES,
-        WORKER_CLASSES,
-        PALLET_CLASSES,
-        FORKLIFT_CLASSES,
+        WORKER_CLASS,
+        HELMET_CLASS,
+        VEST_CLASS,
+        PALLET_CLASS,
+        BOX_CLASS,
+        FORKLIFT_CLASS,
         VIOLATION_SEVERITY,
+    )
+    from .associate import (
+        worker_has_helmet,
+        worker_has_vest,
+        pallet_is_filled,
+        forklift_is_operating,
     )
 except ImportError:
     # Loaded as a top-level module (local `cd ml && python detect.py ...`).
     from classes import (  # type: ignore[no-redef]
         CLASS_NAMES,
-        PPE_VIOLATION_CLASSES,
-        WORKER_CLASSES,
-        PALLET_CLASSES,
-        FORKLIFT_CLASSES,
+        WORKER_CLASS,
+        HELMET_CLASS,
+        VEST_CLASS,
+        PALLET_CLASS,
+        BOX_CLASS,
+        FORKLIFT_CLASS,
         VIOLATION_SEVERITY,
     )
+    from associate import (  # type: ignore[no-redef]
+        worker_has_helmet,
+        worker_has_vest,
+        pallet_is_filled,
+        forklift_is_operating,
+    )
+
+
+# Workers below this confidence are dropped before association — phantom
+# worker detections would otherwise spawn spurious "no helmet" violations.
+WORKER_CONF_THRESHOLD = 0.30
 
 
 # ─── INSTALL DEPS IF NEEDED ─────────────────────────────────
@@ -93,59 +114,132 @@ def check_violations(detections: list, zones: list) -> list:
     return violations
 
 
-# ─── PPE VIOLATION CHECK (classification-driven) ─────────────
+# ─── PPE VIOLATION CHECK (association-driven, mutually exclusive) ────
+def _violation(cls: str, worker: dict, level: str) -> dict:
+    return {
+        "class":       cls,
+        "bbox":        worker["bbox"],
+        "confidence":  worker["confidence"],
+        "alert_level": level,
+    }
+
+
 def check_ppe_violations(detections: list) -> list:
     """
-    Returns one violation dict per detection whose class is a PPE violation
-    class (e.g. worker_no_helmet, worker_no_reflective_vest). No polygon
-    required — the class itself encodes the violation.
+    Derive PPE violations from bbox association. The model emits base classes
+    only; compliance state comes from whether a helmet / vest is associated
+    with each worker bbox (see ml/associate.py for the rules).
+
+    Phase-2 precedence chain — each worker emits AT MOST ONE entry:
+      - missing both helmet and vest → worker_unsafe   (critical)
+      - missing helmet only          → worker_no_helmet (danger)
+      - missing vest only            → worker_no_vest  (danger)
+      - has both                     → no emission (compliant)
+
+    This keeps `total_violations` honest as the count of unsafe workers, not
+    the count of PPE failures across workers × items.
+
+    Workers below WORKER_CONF_THRESHOLD are dropped before association.
     """
+    workers = [d for d in detections
+               if d["class"] == WORKER_CLASS
+               and d["confidence"] >= WORKER_CONF_THRESHOLD]
+    helmets = [d for d in detections if d["class"] == HELMET_CLASS]
+    vests   = [d for d in detections if d["class"] == VEST_CLASS]
+
     out = []
-    for det in detections:
-        cls = det["class"]
-        if cls in PPE_VIOLATION_CLASSES:
-            out.append({
-                "class":       cls,
-                "bbox":        det["bbox"],
-                "confidence":  det["confidence"],
-                "alert_level": VIOLATION_SEVERITY[cls],
-            })
+    for w in workers:
+        has_helmet = worker_has_helmet(w["bbox"], helmets)
+        has_vest   = worker_has_vest(w["bbox"], vests)
+
+        if not has_helmet and not has_vest:
+            out.append(_violation("worker_unsafe",    w, VIOLATION_SEVERITY["worker_unsafe"]))
+        elif not has_helmet:
+            out.append(_violation("worker_no_helmet", w, VIOLATION_SEVERITY["worker_no_helmet"]))
+        elif not has_vest:
+            out.append(_violation("worker_no_vest",   w, VIOLATION_SEVERITY["worker_no_vest"]))
+        # else: compliant — no emission
     return out
 
 
 # ─── INVENTORY / TELEMETRY SUMMARY ───────────────────────────
 def summarize_inventory(detections: list) -> dict:
     """
-    Aggregate state/telemetry counters from class detections. Pallet and
-    forklift sub-classes are *state*, not violations.
+    Aggregate state/telemetry from base-class detections via association.
+      - pallets_filled / pallets_empty: based on whether a box's center lies
+        inside the pallet's bbox.
+      - forklifts_operating / forklifts_idle: based on whether a worker is
+        associated with the forklift (phase-2 — replaces the box-IoU rule).
+      - workers_total: count of workers above WORKER_CONF_THRESHOLD.
+      - workers_compliant: workers with both a helmet AND a vest associated.
     """
-    counts = {c: 0 for c in CLASS_NAMES}
-    for det in detections:
-        cls = det["class"]
-        if cls in counts:
-            counts[cls] += 1
+    workers   = [d for d in detections
+                 if d["class"] == WORKER_CLASS
+                 and d["confidence"] >= WORKER_CONF_THRESHOLD]
+    helmets   = [d for d in detections if d["class"] == HELMET_CLASS]
+    vests     = [d for d in detections if d["class"] == VEST_CLASS]
+    pallets   = [d for d in detections if d["class"] == PALLET_CLASS]
+    boxes     = [d for d in detections if d["class"] == BOX_CLASS]
+    forklifts = [d for d in detections if d["class"] == FORKLIFT_CLASS]
 
-    with_helmet     = counts["worker_with_helmet"]
-    no_helmet       = counts["worker_no_helmet"]
-    with_reflective = counts["worker_with_reflective"]
-    no_reflective   = counts["worker_no_reflective_vest"]
+    pallets_filled = sum(1 for p in pallets if pallet_is_filled(p["bbox"], boxes))
+    pallets_empty  = len(pallets) - pallets_filled
 
-    workers_total = with_helmet + no_helmet + with_reflective + no_reflective
+    forklifts_operating = sum(1 for f in forklifts if forklift_is_operating(f["bbox"], workers))
+    forklifts_idle      = len(forklifts) - forklifts_operating
 
-    # TODO: associate per-worker — model emits per-attribute classes, so a
-    # single worker may be detected as both `worker_with_helmet` AND
-    # `worker_with_reflective`. Until we have a tracker that fuses both
-    # attributes onto one identity, we approximate "fully compliant" as the
-    # min of the two compliant counts.
-    workers_compliant = min(with_helmet, with_reflective)
+    workers_compliant = sum(
+        1 for w in workers
+        if worker_has_helmet(w["bbox"], helmets) and worker_has_vest(w["bbox"], vests)
+    )
 
     return {
-        "pallets_filled":     counts["pallet_filled"],
-        "pallets_empty":      counts["pallet_empty"],
-        "forklifts_carrying": counts["forklift_with_boxes"],
-        "forklifts_idle":     counts["forklift_no_carry"],
-        "workers_total":      workers_total,
-        "workers_compliant":  workers_compliant,
+        "pallets_filled":      pallets_filled,
+        "pallets_empty":       pallets_empty,
+        "forklifts_operating": forklifts_operating,
+        "forklifts_idle":      forklifts_idle,
+        "workers_total":       len(workers),
+        "workers_compliant":   workers_compliant,
+    }
+
+
+# ─── COMPLIANCE SUMMARY ──────────────────────────────────────
+def summarize_compliance(detections: list, ppe_violations: list) -> dict:
+    """
+    Roll-up of worker compliance and severity counts. Designed to feed the
+    dashboard's KPI tiles directly. Counts are derived from `ppe_violations`
+    so they stay consistent with the precedence chain in
+    `check_ppe_violations` (one entry per worker).
+
+    Output:
+      workers_total / workers_compliant / workers_partial / workers_unsafe
+      critical_count / danger_count / warning_count
+    """
+    workers = [d for d in detections
+               if d["class"] == WORKER_CLASS
+               and d["confidence"] >= WORKER_CONF_THRESHOLD]
+
+    by_severity = {"critical": 0, "danger": 0, "warning": 0, "info": 0}
+    workers_unsafe  = 0
+    workers_partial = 0
+    for v in ppe_violations:
+        level = v.get("alert_level", "warning")
+        by_severity[level] = by_severity.get(level, 0) + 1
+        if v["class"] == "worker_unsafe":
+            workers_unsafe += 1
+        else:
+            workers_partial += 1
+
+    workers_compliant = max(0, len(workers) - workers_unsafe - workers_partial)
+
+    return {
+        "workers_total":     len(workers),
+        "workers_compliant": workers_compliant,
+        "workers_partial":   workers_partial,
+        "workers_unsafe":    workers_unsafe,
+        "critical_count":    by_severity["critical"],
+        "danger_count":      by_severity["danger"],
+        "warning_count":     by_severity["warning"],
     }
 
 
@@ -203,7 +297,8 @@ def save_detection_log(camera_id: str, image_url: str,
                        detections: list,
                        ppe_violations: list,
                        zone_violations: list,
-                       inventory: dict):
+                       inventory: dict,
+                       compliance_summary: Optional[dict] = None):
     from supabase import create_client
 
     url = os.environ["NEXT_PUBLIC_SUPABASE_URL"]
@@ -212,12 +307,19 @@ def save_detection_log(camera_id: str, image_url: str,
 
     all_violations = ppe_violations + zone_violations
 
+    # Phase-2: persist compliance_summary inside the existing inventory JSONB
+    # so we don't need a schema migration to add a column. The /detect API
+    # response keeps it at top level for ergonomic consumers (see brief §4).
+    inventory_with_summary = dict(inventory)
+    if compliance_summary is not None:
+        inventory_with_summary["compliance_summary"] = compliance_summary
+
     sb.table("detection_logs").insert({
         "camera_id":        camera_id,
         "image_url":        image_url,
         "detections":       detections,
         "violations":       all_violations,
-        "inventory":        inventory,
+        "inventory":        inventory_with_summary,
         "total_objects":    len(detections),
         "total_violations": len(all_violations),
     }).execute()
@@ -250,26 +352,32 @@ def analyze_image(image_path: str, camera_id: str,
     zone_violations = check_violations(detections, zones)
     print(f"   Found {len(zone_violations)} zone violations")
 
+    # 5. Compliance summary — derived from PPE violations only (zone violations
+    # have their own severity but don't represent worker-PPE state).
+    compliance_summary = summarize_compliance(detections, ppe_violations)
+
     for v in ppe_violations:
-        level_icon = {"danger": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(v["alert_level"], "⚠️")
+        level_icon = {"critical": "🛑", "danger": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(v["alert_level"], "⚠️")
         print(f"   {level_icon} [PPE/{v['alert_level'].upper()}] {v['class']}")
     for v in zone_violations:
-        level_icon = {"danger": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(v["alert_level"], "⚠️")
+        level_icon = {"critical": "🛑", "danger": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(v["alert_level"], "⚠️")
         print(f"   {level_icon} [ZONE/{v['alert_level'].upper()}] {v['class']} in {v['zone_name']}")
 
-    # 5. Persist
+    # 6. Persist
     save_detection_log(
         camera_id, image_url,
         detections, ppe_violations, zone_violations, inventory,
+        compliance_summary=compliance_summary,
     )
 
     return {
-        "detections":       detections,
-        "ppe_violations":   ppe_violations,
-        "zone_violations":  zone_violations,
-        "inventory":        inventory,
-        "total_objects":    len(detections),
-        "total_violations": len(ppe_violations) + len(zone_violations),
+        "detections":         detections,
+        "ppe_violations":     ppe_violations,
+        "zone_violations":    zone_violations,
+        "inventory":          inventory,
+        "compliance_summary": compliance_summary,
+        "total_objects":      len(detections),
+        "total_violations":   len(ppe_violations) + len(zone_violations),
     }
 
 

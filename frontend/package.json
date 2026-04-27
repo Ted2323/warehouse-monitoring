@@ -12,10 +12,13 @@
     "@supabase/ssr": "^0.3.0",
     "@supabase/supabase-js": "^2.43.1",
     "clsx": "^2.1.1",
+    "framer-motion": "^12.38.0",
     "lucide-react": "^0.383.0",
     "next": "^16.2.2",
     "react": "^18",
     "react-dom": "^18",
+    "recharts": "^3.8.1",
+    "sonner": "^2.0.7",
     "tailwind-merge": "^2.3.0"
   },
   "devDependencies": {

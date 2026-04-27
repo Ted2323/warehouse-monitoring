@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { cookies } from "next/headers";
 import { Source_Serif_4, Inter, JetBrains_Mono } from "next/font/google";
+import { Toaster } from "sonner";
 import "./globals.css";
 
 const sans = Inter({
@@ -54,7 +55,14 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_BOOTSTRAP }} />
       </head>
-      <body className="antialiased font-sans bg-bg text-fg">{children}</body>
+      <body className="antialiased font-sans bg-bg text-fg">
+        {children}
+        {/* Phase-3: live toast feed for new violations. richColors gives
+            sonner's default amber/red theming, which lines up with our
+            danger/critical severities — see app/dashboard/page.tsx for
+            the firing logic + sliding-window de-dupe. */}
+        <Toaster position="top-right" richColors theme={isDark ? "dark" : "light"} />
+      </body>
     </html>
   );
 }
