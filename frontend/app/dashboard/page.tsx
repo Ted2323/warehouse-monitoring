@@ -295,6 +295,12 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
+    // Fire a wakeup ping in parallel with the logs fetch so the Render
+    // free-tier container starts booting while the user is still picking a
+    // file. By the time they upload, /detect is warm and the cold-start
+    // poll inside /api/detect is skipped entirely.
+    fetch("/api/wakeup").catch(() => {});
+
     fetch(`/api/logs?camera_id=${CAMERA_ID}&limit=50`)
       .then(r => r.json())
       .then(({ logs }) => {

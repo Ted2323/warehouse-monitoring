@@ -5,20 +5,41 @@ import { NextRequest, NextResponse } from "next/server";
 // below uses hardcoded base-class detections + pre-derived violations so we
 // don't have to mirror the association rules from ml/associate.py here.
 
-// Vercel function budget — Render free-tier cold start can take ~30-60s,
-// and we want headroom for one retry inside the route. Hobby plan caps at
-// 60s; we ask for 30 so a single sluggish frame doesn't take the whole
-// video down.
-export const maxDuration = 30;
+// Vercel function budget — Render free-tier cold start can take ~30-60s.
+// Hobby plan caps at 60s; we use the full budget so a cold boot + a single
+// /detect attempt fit inside one invocation. The cold-start path below is
+// bounded so we always leave room for the real /detect call.
+export const maxDuration = 60;
 
 // ─── COLD-START RETRY HELPERS ────────────────────────────────
 // Render's free tier spins the container down after ~15 min idle. The first
 // request after idle gets a 502/503 HTML page from Render's edge proxy in
-// ~100-200ms while the container boots (~30-60s). We hit /health to nudge
-// it awake, wait, and retry the actual /detect once. Warm requests bypass
-// this entirely.
+// ~100-200ms while the container boots (~30-60s). On detecting that, we
+// poll /health until it returns 200 (with a hard budget), then issue the
+// real /detect call. Polling beats a fixed sleep: warm boots return in a
+// few seconds and we don't burn the whole budget on a guess.
 const COLD_START_STATUSES = new Set([502, 503, 504]);
-const COLD_START_RETRY_DELAY_MS = 8_000;
+const HEALTH_POLL_BUDGET_MS   = 45_000;
+const HEALTH_POLL_INTERVAL_MS = 1_500;
+const HEALTH_POLL_TIMEOUT_MS  = 4_000;
+
+async function waitForHealthy(serviceUrl: string): Promise<boolean> {
+  const deadline = Date.now() + HEALTH_POLL_BUDGET_MS;
+  while (Date.now() < deadline) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), HEALTH_POLL_TIMEOUT_MS);
+      const res = await fetch(`${serviceUrl}/health`, { signal: ctrl.signal });
+      clearTimeout(timer);
+      res.body?.cancel().catch(() => {});
+      if (res.ok) return true;
+    } catch {
+      // Connection refused / aborted while container boots — keep polling.
+    }
+    await new Promise((r) => setTimeout(r, HEALTH_POLL_INTERVAL_MS));
+  }
+  return false;
+}
 
 async function fetchWithColdStartRetry(
   serviceUrl: string,
@@ -35,14 +56,16 @@ async function fetchWithColdStartRetry(
     body: JSON.stringify(body),
   };
 
-  let res = await fetch(url, opts);
+  const res = await fetch(url, opts);
   if (!COLD_START_STATUSES.has(res.status)) return res;
 
-  // Discard the body so the connection can be reused for the retry, then
-  // poke /health (fire-and-forget) and wait for the container to boot.
+  // Cold start signature — drain the response body so the socket can be
+  // reused, then wait for /health before retrying. If the container never
+  // becomes healthy within budget, return the original 502 so the caller
+  // can surface the cold-start hint without us blowing past maxDuration.
   res.body?.cancel().catch(() => {});
-  fetch(`${serviceUrl}/health`).catch(() => {});
-  await new Promise((r) => setTimeout(r, COLD_START_RETRY_DELAY_MS));
+  const healthy = await waitForHealthy(serviceUrl);
+  if (!healthy) return res;
 
   return fetch(url, opts);
 }
