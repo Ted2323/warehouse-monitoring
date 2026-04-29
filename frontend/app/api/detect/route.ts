@@ -1,4 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
+import { MIN_CONFIDENCE } from "@/lib/classes";
+
+// Filter helpers — drop anything the model emitted below MIN_CONFIDENCE so
+// (a) the UI never draws a low-confidence bbox and (b) detection_logs only
+// stores entries we'd be willing to act on as a security violation.
+const meetsMinConfidence = (x: { confidence?: number } | null | undefined) =>
+  typeof x?.confidence === "number" && x.confidence >= MIN_CONFIDENCE;
 
 // NOTE on imports: when DETECTION_SERVICE_URL is set, this route is a thin
 // proxy and the FastAPI service does all class-aware work. The mock path
@@ -287,6 +294,14 @@ export async function POST(req: NextRequest) {
         }
       }
     }
+
+    // Confidence gate — drop sub-MIN_CONFIDENCE entries before they reach the
+    // UI or the audit log. The Python service may use a lower YOLO threshold
+    // for inventory accuracy, but anything we draw or persist as a violation
+    // must clear MIN_CONFIDENCE.
+    detections     = detections.filter(meetsMinConfidence);
+    ppeViolations  = ppeViolations.filter(meetsMinConfidence);
+    zoneViolations = zoneViolations.filter(meetsMinConfidence);
 
     // Merge for legacy `violations` key (so older consumers still see something).
     const violations = [...ppeViolations, ...zoneViolations];

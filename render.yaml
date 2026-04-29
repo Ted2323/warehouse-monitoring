@@ -24,3 +24,8 @@ services:
         value: "models"
       - key: MODEL_OBJECT
         value: "best.pt"
+      - key: DETECT_CONF
+        value: "0.5"    # enforce 50% bbox/violation threshold at YOLO inference
+                        # so inventory + compliance counts agree with what the
+                        # dashboard renders. /api/detect also filters as a
+                        # defense-in-depth in case this is changed at runtime.

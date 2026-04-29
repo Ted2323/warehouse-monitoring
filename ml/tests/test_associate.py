@@ -171,10 +171,13 @@ def test_compliance_summary_severity_counts_match_violations():
 
 
 def test_compliance_summary_ignores_low_confidence_workers():
-    """Workers below the 0.30 threshold don't count toward workers_total."""
+    """Workers below WORKER_CONF_THRESHOLD (0.50) don't count toward workers_total."""
     detections = [
         {"class": "worker", "confidence": 0.95, "bbox": [0, 0, 100, 300], "cx": 50, "cy": 150},
         {"class": "worker", "confidence": 0.10, "bbox": [200, 0, 300, 300], "cx": 250, "cy": 150},
+        # 0.40 used to count under the old 0.30 threshold; under the
+        # tightened 0.50 threshold it must be dropped.
+        {"class": "worker", "confidence": 0.40, "bbox": [400, 0, 500, 300], "cx": 450, "cy": 150},
     ]
     s = summarize_compliance(detections, check_ppe_violations(detections))
     assert s["workers_total"] == 1
