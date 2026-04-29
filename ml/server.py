@@ -212,6 +212,26 @@ async def detect(req: DetectRequest):
         tmp_path = tmp.name
 
     try:
+        # Downscale large images before YOLO. On Render free tier (0.5 CPU,
+        # 512 MB RAM) a 4000x3000 stock photo decompresses to ~108 MB of RGB
+        # pixels, eating half the RAM budget and 30-60s of preprocessing
+        # before YOLO even runs (YOLO itself works at 640x640 internally).
+        # 1280px max preserves plenty of headroom for accuracy while turning
+        # tens-of-seconds requests into sub-10s ones.
+        try:
+            from PIL import Image
+            with Image.open(tmp_path) as im:
+                w, h = im.size
+                if max(w, h) > 1280:
+                    im.thumbnail((1280, 1280), Image.LANCZOS)
+                    # Re-save in place; JPEG keeps file small for the YOLO
+                    # loader. Strip EXIF since we don't need orientation
+                    # metadata for detection.
+                    im.convert("RGB").save(tmp_path, "JPEG", quality=85, optimize=False)
+                    log.info("Downscaled input %dx%d -> %dx%d for inference", w, h, *im.size)
+        except Exception as exc:
+            log.warning("Image downscale skipped (%s) — proceeding at original size", exc)
+
         # 2. Run YOLOv8 inference
         detections = run_inference(tmp_path, req.model_path)
 

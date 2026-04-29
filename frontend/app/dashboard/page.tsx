@@ -345,10 +345,34 @@ export default function DashboardPage() {
     ]);
   }, []);
 
+  // Render free-tier inference is CPU-bound and chokes on multi-megapixel
+  // stock photos (a 4000x3000 JPEG decompresses to ~108 MB of RGB). Downscale
+  // in-browser to 1280px max before upload — YOLO runs at 640x640 internally
+  // so we don't lose detection accuracy and we save Supabase bandwidth too.
+  // Video frames already come pre-sized through canvas, so this is a no-op
+  // for them.
+  const downscaleForUpload = async (file: File | Blob, sourceName: string): Promise<Blob> => {
+    if (!file.type?.startsWith("image/")) return file;
+    const bitmap = await createImageBitmap(file).catch(() => null);
+    if (!bitmap) return file;
+    const max = Math.max(bitmap.width, bitmap.height);
+    if (max <= 1280) { bitmap.close(); return file; }
+    const scale = 1280 / max;
+    const w = Math.round(bitmap.width * scale);
+    const h = Math.round(bitmap.height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close();
+    return new Promise<Blob>(r => canvas.toBlob(b => r(b!), "image/jpeg", 0.85));
+  };
+
   const processImage = useCallback(async (file: File | Blob, sourceName: string): Promise<AuditEntry> => {
     const previewSrc = URL.createObjectURL(file);
+    const uploadBlob = await downscaleForUpload(file, sourceName);
     const fd = new FormData();
-    fd.append("image", file, sourceName);
+    fd.append("image", uploadBlob, sourceName);
     fd.append("camera_id", CAMERA_ID);
     const res  = await fetch("/api/detect", { method: "POST", body: fd });
     const data = await res.json();
