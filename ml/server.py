@@ -197,6 +197,19 @@ async def detect(req: DetectRequest):
         with open(MOCK_PATH) as f:
             return json.load(f)
 
+    # Per-phase timing — Vercel keeps surfacing 504s and the only way to size
+    # the next fix is to know which step actually eats the budget. Logged at
+    # INFO so it shows up in the default Render log stream.
+    import time as _time
+    timings: dict[str, float] = {}
+    def _phase(name: str, t0: float) -> float:
+        elapsed = _time.monotonic() - t0
+        timings[name] = elapsed
+        log.info("[/detect] %-14s %6.2fs", name, elapsed)
+        return _time.monotonic()
+
+    t = _time.monotonic()
+
     # 1. Download image to a temp file
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(req.image_url)
@@ -211,6 +224,8 @@ async def detect(req: DetectRequest):
         tmp.write(resp.content)
         tmp_path = tmp.name
 
+    t = _phase("fetch_image", t)
+
     try:
         # Downscale large images before YOLO. On Render free tier (0.5 CPU,
         # 512 MB RAM) a 4000x3000 stock photo decompresses to ~108 MB of RGB
@@ -224,22 +239,25 @@ async def detect(req: DetectRequest):
                 w, h = im.size
                 if max(w, h) > 1280:
                     im.thumbnail((1280, 1280), Image.LANCZOS)
-                    # Re-save in place; JPEG keeps file small for the YOLO
-                    # loader. Strip EXIF since we don't need orientation
-                    # metadata for detection.
                     im.convert("RGB").save(tmp_path, "JPEG", quality=85, optimize=False)
                     log.info("Downscaled input %dx%d -> %dx%d for inference", w, h, *im.size)
         except Exception as exc:
             log.warning("Image downscale skipped (%s) — proceeding at original size", exc)
 
+        t = _phase("downscale", t)
+
         # 2. Run YOLOv8 inference
         detections = run_inference(tmp_path, req.model_path)
+        t = _phase("inference", t)
 
         # 3. PPE (association-driven) + inventory + zone (secondary)
         ppe_violations     = check_ppe_violations(detections)
         inventory          = summarize_inventory(detections)
         compliance_summary = summarize_compliance(detections, ppe_violations)
+        t = _phase("associate", t)
+
         zones              = get_zones(req.camera_id)
+        t = _phase("get_zones", t)
         zone_violations    = check_violations(detections, zones)
 
         # 4. Persist
@@ -248,6 +266,10 @@ async def detect(req: DetectRequest):
             detections, ppe_violations, zone_violations, inventory,
             compliance_summary=compliance_summary,
         )
+        t = _phase("persist", t)
+
+        log.info("[/detect] TOTAL          %6.2fs  (n_det=%d)",
+                 sum(timings.values()), len(detections))
 
         return {
             "detections":         detections,
@@ -257,6 +279,7 @@ async def detect(req: DetectRequest):
             "compliance_summary": compliance_summary,
             "total_objects":      len(detections),
             "total_violations":   len(ppe_violations) + len(zone_violations),
+            "timings_s":          {k: round(v, 3) for k, v in timings.items()},
         }
     finally:
         os.unlink(tmp_path)
