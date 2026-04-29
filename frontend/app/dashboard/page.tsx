@@ -368,6 +368,33 @@ export default function DashboardPage() {
     return new Promise<Blob>(r => canvas.toBlob(b => r(b!), "image/jpeg", 0.85));
   };
 
+  // Render free-tier inference takes ~80-100s — well past Vercel's 60s
+  // function ceiling — so /api/detect responds 202 with the image_url and
+  // Render persists the result asynchronously. We poll /api/logs for that
+  // image_url until the row materialises. 3-minute ceiling so a stuck job
+  // surfaces an error instead of spinning forever.
+  const POLL_INTERVAL_MS = 1_500;
+  const POLL_TIMEOUT_MS  = 180_000;
+
+  const pollForDetectionResult = async (imageUrl: string, cameraId: string): Promise<any> => {
+    const start = Date.now();
+    while (Date.now() - start < POLL_TIMEOUT_MS) {
+      try {
+        const res = await fetch(
+          `/api/logs?camera_id=${encodeURIComponent(cameraId)}&image_url=${encodeURIComponent(imageUrl)}&limit=1`,
+        );
+        if (res.ok) {
+          const { logs } = await res.json();
+          if (logs && logs.length > 0) return logs[0];
+        }
+      } catch {
+        // network blip — keep polling
+      }
+      await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+    }
+    throw new Error(`Detection timed out after ${POLL_TIMEOUT_MS / 1000}s — please retry`);
+  };
+
   const processImage = useCallback(async (file: File | Blob, sourceName: string): Promise<AuditEntry> => {
     const previewSrc = URL.createObjectURL(file);
     const uploadBlob = await downscaleForUpload(file, sourceName);
@@ -376,7 +403,23 @@ export default function DashboardPage() {
     fd.append("camera_id", CAMERA_ID);
     const res  = await fetch("/api/detect", { method: "POST", body: fd });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Detection failed");
+    // 202 is success in the async flow — the request is queued, not failed.
+    if (!res.ok && res.status !== 202) throw new Error(data.error || "Detection failed");
+
+    // Async path: Render is processing, poll until detection_logs has the row.
+    if (data.status === "queued" && data.image_url) {
+      const row = await pollForDetectionResult(data.image_url, CAMERA_ID);
+      const adapted = adaptLog(row);
+      return {
+        ...adapted,
+        id:        crypto.randomUUID(),  // fresh client-side id (timeline keying)
+        timestamp: new Date(),           // wall-clock at completion
+        source:    sourceName,
+        previewSrc,                      // browser blob URL — no re-fetch needed
+      };
+    }
+
+    // Sync path (mock): full payload arrives inline.
     return {
       id:                crypto.randomUUID(),
       timestamp:         new Date(),
@@ -389,7 +432,7 @@ export default function DashboardPage() {
       previewSrc,
       imageUrl:          data.image_url,
     };
-  }, []);
+  }, [adaptLog]);
 
   const extractFrames = useCallback(
     (videoFile: File, intervalSec = 2): Promise<{ frames: { blob: Blob; t: number }[]; duration: number }> =>

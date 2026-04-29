@@ -33,6 +33,7 @@ export async function GET(req: NextRequest) {
 
   const { searchParams } = new URL(req.url);
   const cameraId = searchParams.get("camera_id");
+  const imageUrl = searchParams.get("image_url");
   const limit    = parseInt(searchParams.get("limit") || "50");
 
   let query = supabase
@@ -42,6 +43,11 @@ export async function GET(req: NextRequest) {
     .limit(limit);
 
   if (cameraId) query = query.eq("camera_id", cameraId);
+  // image_url is the implicit request id used by the dashboard's polling
+  // loop after submitting an async /api/detect — see processImage in
+  // dashboard/page.tsx. Each upload gets a unique storage key so this is
+  // effectively a single-row lookup.
+  if (imageUrl) query = query.eq("image_url", imageUrl);
 
   const { data, error } = await query;
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });

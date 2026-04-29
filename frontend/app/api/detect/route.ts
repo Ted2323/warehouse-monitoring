@@ -247,6 +247,21 @@ export async function POST(req: NextRequest) {
           : `Detection service ${res.status}: ${text.slice(0, 300) || res.statusText}`;
         return NextResponse.json({ error: userMsg }, { status: 502 });
       }
+      // Async path — Render returns 202 and processes inference in a
+      // background task. Inference on free tier exceeds Vercel's 60s
+      // function ceiling, so we hand the image_url back to the client and
+      // it polls /api/logs?image_url=... until the row materialises.
+      // We don't filter or persist on Vercel for this path; Render's
+      // pipeline handles both.
+      if (res.status === 202) {
+        const queued = await res.json().catch(() => ({}));
+        return NextResponse.json({
+          status:    "queued",
+          image_url: imageUrl,
+          camera_id: cameraId,
+          ...queued,
+        }, { status: 202 });
+      }
       const result = await res.json();
       detections        = result.detections         ?? [];
       ppeViolations     = result.ppe_violations     ?? [];

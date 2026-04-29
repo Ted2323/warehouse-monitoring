@@ -25,7 +25,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -188,20 +188,32 @@ def health():
     }
 
 
-@app.post("/detect")
-async def detect(req: DetectRequest):
-    # ── Mock mode: serve fixture, skip download + inference ──
-    if MOCK_MODE:
-        if not MOCK_PATH.exists():
-            raise HTTPException(status_code=500, detail=f"Mock fixture missing: {MOCK_PATH}")
-        with open(MOCK_PATH) as f:
-            return json.load(f)
+# Mirrors frontend MIN_CONFIDENCE (lib/classes.ts). Applied here at the
+# persist boundary so detection_logs only ever contains entries we'd be
+# willing to draw — independent of whether the caller is the sync mock path
+# or the async background pipeline.
+MIN_CONFIDENCE = 0.5
 
-    # Per-phase timing — Vercel keeps surfacing 504s and the only way to size
-    # the next fix is to know which step actually eats the budget. Logged at
-    # INFO so it shows up in the default Render log stream.
+
+def _filter_min_conf(items: list) -> list:
+    return [x for x in items if isinstance(x, dict) and x.get("confidence", 0) >= MIN_CONFIDENCE]
+
+
+def _run_pipeline_sync(image_url: str, camera_id: str, model_path: str) -> None:
+    """Background pipeline: fetch → inference → persist.
+
+    Runs in FastAPI's threadpool after /detect has returned 202 to the caller.
+    Errors are logged but don't surface to the user — by design, since the
+    response has already been sent. The dashboard polls /api/logs by
+    image_url and surfaces a timeout if no row appears.
+
+    Render free tier inference is ~80-100s for a single image on the warmed
+    YOLOv8n model; the threadpool serializes background tasks per worker, so
+    sequential uploads queue. That's acceptable for the demo's scale.
+    """
     import time as _time
     timings: dict[str, float] = {}
+
     def _phase(name: str, t0: float) -> float:
         elapsed = _time.monotonic() - t0
         timings[name] = elapsed
@@ -210,29 +222,30 @@ async def detect(req: DetectRequest):
 
     t = _time.monotonic()
 
-    # 1. Download image to a temp file
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(req.image_url)
+    # 1. Fetch image (sync httpx — we're already in a threadpool worker, so
+    #    blocking I/O is fine and avoids the asyncio bridge from sync code).
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(image_url)
         if resp.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Could not fetch image: {resp.status_code}")
+            log.error("[/detect] fetch_image failed: HTTP %s for %s", resp.status_code, image_url)
+            return
+    except Exception:
+        log.exception("[/detect] fetch_image raised for %s", image_url)
+        return
 
-    ext = "." + req.image_url.split(".")[-1].split("?")[0]
+    ext = "." + image_url.split(".")[-1].split("?")[0]
     if ext not in (".jpg", ".jpeg", ".png", ".webp"):
         ext = ".jpg"
 
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(resp.content)
         tmp_path = tmp.name
-
     t = _phase("fetch_image", t)
 
     try:
-        # Downscale large images before YOLO. On Render free tier (0.5 CPU,
-        # 512 MB RAM) a 4000x3000 stock photo decompresses to ~108 MB of RGB
-        # pixels, eating half the RAM budget and 30-60s of preprocessing
-        # before YOLO even runs (YOLO itself works at 640x640 internally).
-        # 1280px max preserves plenty of headroom for accuracy while turning
-        # tens-of-seconds requests into sub-10s ones.
+        # 2. Downscale (defense in depth — browser already does this for the
+        #    happy path, but raw API callers might ship 4000x3000 images).
         try:
             from PIL import Image
             with Image.open(tmp_path) as im:
@@ -243,26 +256,31 @@ async def detect(req: DetectRequest):
                     log.info("Downscaled input %dx%d -> %dx%d for inference", w, h, *im.size)
         except Exception as exc:
             log.warning("Image downscale skipped (%s) — proceeding at original size", exc)
-
         t = _phase("downscale", t)
 
-        # 2. Run YOLOv8 inference
-        detections = run_inference(tmp_path, req.model_path)
+        # 3. Inference
+        detections = run_inference(tmp_path, model_path)
         t = _phase("inference", t)
 
-        # 3. PPE (association-driven) + inventory + zone (secondary)
+        # 4. Association (PPE) + inventory + compliance
         ppe_violations     = check_ppe_violations(detections)
         inventory          = summarize_inventory(detections)
         compliance_summary = summarize_compliance(detections, ppe_violations)
         t = _phase("associate", t)
 
-        zones              = get_zones(req.camera_id)
+        zones              = get_zones(camera_id)
         t = _phase("get_zones", t)
         zone_violations    = check_violations(detections, zones)
 
-        # 4. Persist
+        # 5. Confidence gate before persist — detection_logs must only ever
+        #    contain entries the dashboard would render.
+        detections      = _filter_min_conf(detections)
+        ppe_violations  = _filter_min_conf(ppe_violations)
+        zone_violations = _filter_min_conf(zone_violations)
+
+        # 6. Persist
         save_detection_log(
-            req.camera_id, req.image_url,
+            camera_id, image_url,
             detections, ppe_violations, zone_violations, inventory,
             compliance_summary=compliance_summary,
         )
@@ -270,19 +288,37 @@ async def detect(req: DetectRequest):
 
         log.info("[/detect] TOTAL          %6.2fs  (n_det=%d)",
                  sum(timings.values()), len(detections))
-
-        return {
-            "detections":         detections,
-            "ppe_violations":     ppe_violations,
-            "zone_violations":    zone_violations,
-            "inventory":          inventory,
-            "compliance_summary": compliance_summary,
-            "total_objects":      len(detections),
-            "total_violations":   len(ppe_violations) + len(zone_violations),
-            "timings_s":          {k: round(v, 3) for k, v in timings.items()},
-        }
+    except Exception:
+        log.exception("[/detect] pipeline failed for %s", image_url)
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+@app.post("/detect")
+async def detect(req: DetectRequest, background: BackgroundTasks):
+    """
+    Mock mode: returns the fixture synchronously (200) so demos stay snappy.
+
+    Real mode: schedules `_run_pipeline_sync` as a background task and
+    returns 202 immediately with the image_url. The dashboard polls
+    /api/logs?image_url=... until the row materialises. This pattern
+    bypasses Vercel's 60s function ceiling, which the previous synchronous
+    shape exceeded on Render free tier (~80-100s per inference).
+    """
+    if MOCK_MODE:
+        if not MOCK_PATH.exists():
+            raise HTTPException(status_code=500, detail=f"Mock fixture missing: {MOCK_PATH}")
+        with open(MOCK_PATH) as f:
+            return json.load(f)
+
+    background.add_task(_run_pipeline_sync, req.image_url, req.camera_id, req.model_path)
+    return JSONResponse(
+        {"status": "queued", "image_url": req.image_url, "camera_id": req.camera_id},
+        status_code=202,
+    )
 
 
 # ─── CLI ENTRYPOINT ──────────────────────────────────────────
