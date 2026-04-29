@@ -59,4 +59,7 @@ export function isPpeViolation(cls: string): boolean {
 // treated as too uncertain to draw or to log as a violation. Enforced at the
 // API boundary in /api/detect (write) and /api/logs (read) so both new and
 // historical data render the same policy in the UI.
-export const MIN_CONFIDENCE = 0.5;
+// Set to 0.25 (Ultralytics' default) because the current model was trained
+// for DETECT_CONF=0.10 (mAP <=0.5 per commit 07e268c); 0.5 zeroed out
+// detections on real-world images. Bump back up once the model improves.
+export const MIN_CONFIDENCE = 0.25;

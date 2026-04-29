@@ -162,12 +162,20 @@ def ensure_model_available() -> None:
     else:
         log.info("Model present at %s — skipping download", model)
 
-    # Warm the YOLO model into memory so the first /detect call doesn't pay
-    # ~3-10s of CPU-torch instantiation while Vercel's 60s budget is ticking.
-    # Failure here is loud: a model that won't load is no better than no model.
+    # Warm the YOLO model into memory + run one dummy forward pass so the
+    # first real /detect doesn't pay ~50-70s of JIT graph compilation. The
+    # load alone (~10s) gets weights into RAM; the dummy inference compiles
+    # the torch graph and primes any internal caches. We saw 73s on the
+    # first request and 21s on the second — the delta is what this fixes.
     log.info("Warming YOLO model from %s", model)
-    load_model(str(model))
-    log.info("YOLO model warmed and cached")
+    yolo = load_model(str(model))
+    try:
+        import numpy as _np  # numpy is already a torch dep — free import
+        dummy = _np.zeros((640, 640, 3), dtype=_np.uint8)
+        yolo(dummy, verbose=False)
+        log.info("YOLO model warmed and cached (forward pass complete)")
+    except Exception as exc:
+        log.warning("YOLO warmup forward pass skipped (%s) — first request will be slow", exc)
 
 
 # ─── SCHEMAS ─────────────────────────────────────────────────
@@ -191,8 +199,9 @@ def health():
 # Mirrors frontend MIN_CONFIDENCE (lib/classes.ts). Applied here at the
 # persist boundary so detection_logs only ever contains entries we'd be
 # willing to draw — independent of whether the caller is the sync mock path
-# or the async background pipeline.
-MIN_CONFIDENCE = 0.5
+# or the async background pipeline. 0.25 because the current model goes
+# silent at 0.5 (mAP <=0.5); raise once the model improves.
+MIN_CONFIDENCE = 0.25
 
 
 def _filter_min_conf(items: list) -> list:
@@ -261,6 +270,17 @@ def _run_pipeline_sync(image_url: str, camera_id: str, model_path: str) -> None:
         # 3. Inference
         detections = run_inference(tmp_path, model_path)
         t = _phase("inference", t)
+
+        # Diagnostic — surface what the model actually produced before we
+        # filter. If we keep seeing n_det=0 in TOTAL even after dropping
+        # DETECT_CONF, the model itself isn't firing on this image.
+        if detections:
+            top = max(d.get("confidence", 0) for d in detections)
+            classes = ", ".join(sorted(set(d["class"] for d in detections)))
+            log.info("[/detect] raw_yolo: n=%d top_conf=%.2f classes=%s",
+                     len(detections), top, classes)
+        else:
+            log.info("[/detect] raw_yolo: n=0  (model emitted no detections)")
 
         # 4. Association (PPE) + inventory + compliance
         ppe_violations     = check_ppe_violations(detections)

@@ -27,7 +27,9 @@ services:
       - key: MODEL_OBJECT
         value: "best.pt"
       - key: DETECT_CONF
-        value: "0.5"    # enforce 50% bbox/violation threshold at YOLO inference
-                        # so inventory + compliance counts agree with what the
-                        # dashboard renders. /api/detect also filters as a
-                        # defense-in-depth in case this is changed at runtime.
+        value: "0.25"   # YOLO inference threshold. The current model was
+                        # trained for DETECT_CONF=0.10 (mAP <=0.5 per
+                        # commit 07e268c) and goes silent at 0.5. 0.25 is
+                        # Ultralytics' default and lets weaker-but-real
+                        # detections through; the dashboard's display filter
+                        # (lib/classes.ts:MIN_CONFIDENCE) stacks on top.

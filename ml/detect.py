@@ -51,9 +51,10 @@ except ImportError:
 
 # Workers below this confidence are dropped before association — phantom
 # worker detections would otherwise spawn spurious "no helmet" violations.
-# Mirrors frontend MIN_CONFIDENCE (lib/classes.ts): a violation we wouldn't
-# render shouldn't be derived in the first place.
-WORKER_CONF_THRESHOLD = 0.50
+# Mirrors frontend MIN_CONFIDENCE (lib/classes.ts). Set to 0.25 because the
+# current model has modest accuracy (mAP <=0.5 per commit 07e268c) and
+# tighter thresholds zeroed out detections on real-world test images.
+WORKER_CONF_THRESHOLD = 0.25
 
 
 # ─── INSTALL DEPS IF NEEDED ─────────────────────────────────
