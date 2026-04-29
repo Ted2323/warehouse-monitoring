@@ -39,6 +39,7 @@ try:
         check_ppe_violations,
         check_violations,
         get_zones,
+        load_model,
         run_inference,
         save_detection_log,
         summarize_compliance,
@@ -49,6 +50,7 @@ except ImportError:
         check_ppe_violations,
         check_violations,
         get_zones,
+        load_model,
         run_inference,
         save_detection_log,
         summarize_compliance,
@@ -146,20 +148,26 @@ def ensure_model_available() -> None:
         return
 
     model = Path(MODEL_PATH)
-    if model.exists():
+    if not model.exists():
+        try:
+            _download_model_from_supabase(model)
+        except Exception as exc:
+            log.exception("Failed to download model from Supabase Storage")
+            # Fail loudly: we are not in mock mode and have no weights. The brief
+            # explicitly says fail, don't fall back silently.
+            raise RuntimeError(
+                f"No model available. MOCK_MODE is off, MODEL_PATH={MODEL_PATH} does "
+                f"not exist, and the Supabase Storage download failed: {exc}"
+            ) from exc
+    else:
         log.info("Model present at %s — skipping download", model)
-        return
 
-    try:
-        _download_model_from_supabase(model)
-    except Exception as exc:
-        log.exception("Failed to download model from Supabase Storage")
-        # Fail loudly: we are not in mock mode and have no weights. The brief
-        # explicitly says fail, don't fall back silently.
-        raise RuntimeError(
-            f"No model available. MOCK_MODE is off, MODEL_PATH={MODEL_PATH} does "
-            f"not exist, and the Supabase Storage download failed: {exc}"
-        ) from exc
+    # Warm the YOLO model into memory so the first /detect call doesn't pay
+    # ~3-10s of CPU-torch instantiation while Vercel's 60s budget is ticking.
+    # Failure here is loud: a model that won't load is no better than no model.
+    log.info("Warming YOLO model from %s", model)
+    load_model(str(model))
+    log.info("YOLO model warmed and cached")
 
 
 # ─── SCHEMAS ─────────────────────────────────────────────────

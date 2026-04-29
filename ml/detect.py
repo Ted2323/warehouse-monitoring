@@ -253,11 +253,28 @@ def summarize_compliance(detections: list, ppe_violations: list) -> dict:
 DETECT_CONF = float(os.environ.get("DETECT_CONF", "0.10"))
 
 
+# Module-level YOLO cache — instantiating YOLO() costs 3-10s on CPU torch
+# (the wheel we ship on Render free tier), so reusing one model across
+# requests turns the per-request cost from "model load + inference" into
+# just inference. server.py warms this at startup so the first /detect
+# after a cold boot doesn't have to pay the load cost while Vercel's
+# 60s budget ticks down.
+_MODEL_CACHE: dict = {}
+
+def load_model(model_path: str = "./best.pt"):
+    """Load (or return cached) YOLO model for `model_path`."""
+    cached = _MODEL_CACHE.get(model_path)
+    if cached is not None:
+        return cached
+    from ultralytics import YOLO
+    model = YOLO(model_path)
+    _MODEL_CACHE[model_path] = model
+    return model
+
+
 def run_inference(image_path: str, model_path: str = "./best.pt",
                   conf: Optional[float] = None) -> list:
-    from ultralytics import YOLO
-
-    model = YOLO(model_path)
+    model = load_model(model_path)
     results = model(image_path, verbose=False, conf=conf or DETECT_CONF)[0]
 
     detections = []

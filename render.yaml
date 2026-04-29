@@ -19,7 +19,9 @@ services:
       - key: DETECTION_SERVICE_TOKEN
         sync: false
       - key: MOCK_MODE
-        value: "true"   # use mock fixture until best.pt is uploaded
+        value: "false"  # best.pt is in Supabase Storage; serve real inference.
+                        # Override to "true" in the Render dashboard if you
+                        # ever need to run the demo without a model.
       - key: MODEL_BUCKET
         value: "models"
       - key: MODEL_OBJECT
